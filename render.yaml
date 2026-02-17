@@ -1,61 +1,58 @@
-services
+services:
   # ════════════════════════════════════════════════════════════
-  # SERVICIO WEB (tu API Flask)
+  # SERVICIO WEB (API Flask)
   # ════════════════════════════════════════════════════════════
-  - type web
-    name flask-jira-api
-    runtime python
-    plan free
-    buildCommand pip install -r requirements.txt
-    startCommand gunicorn appapp --bind 0.0.0.0$PORT --workers 2 --timeout 120
-    
-    # ── Variables de entorno (IMPORTANTE cambia los valores) ──
-    envVars
-      - key PYTHON_VERSION
-        value 3.11.0
-      
+  - type: web
+    name: flask-jira-api
+    runtime: python
+    plan: free
+    pythonVersion: "3.11.0"
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+
+    envVars:
       # Jira
-      - key JIRA_URL
-        value httpsintegratelperu.atlassian.net
-      - key JIRA_EMAIL
-        value maximiliano.merino@integratel.com.pe
-      - key JIRA_TOKEN
-        sync false  # Lo configuraremos manualmente por seguridad
-      
-      # PostgreSQL (se llenan automáticamente desde la BD)
-      - key PG_HOST
-        fromDatabase
-          name flask-jira-db
-          property host
-      - key PG_PORT
-        fromDatabase
-          name flask-jira-db
-          property port
-      - key PG_DATABASE
-        fromDatabase
-          name flask-jira-db
-          property database
-      - key PG_USER
-        fromDatabase
-          name flask-jira-db
-          property user
-      - key PG_PASSWORD
-        fromDatabase
-          name flask-jira-db
-          property password
-      - key PG_SCHEMA
-        value proof
-      
-      # Flask
-      - key FLASK_ENV
-        value production
+      - key: JIRA_URL
+        value: https://integratelperu.atlassian.net
+      - key: JIRA_EMAIL
+        value: maximiliano.merino@integratel.com.pe
+      - key: JIRA_TOKEN
+        sync: false
+
+      # PostgreSQL
+      - key: PG_HOST
+        fromDatabase:
+          name: flask-jira-db
+          property: host
+      - key: PG_PORT
+        fromDatabase:
+          name: flask-jira-db
+          property: port
+      - key: PG_DATABASE
+        fromDatabase:
+          name: flask-jira-db
+          property: database
+      - key: PG_USER
+        fromDatabase:
+          name: flask-jira-db
+          property: user
+      - key: PG_PASSWORD
+        fromDatabase:
+          name: flask-jira-db
+          property: password
+
+      # App
+      - key: PG_SCHEMA
+        value: proof
+      - key: FLASK_ENV
+        value: production
 
   # ════════════════════════════════════════════════════════════
   # BASE DE DATOS PostgreSQL
   # ════════════════════════════════════════════════════════════
-  - type pserv
-    name flask-jira-db
-    plan free
-    databaseName gobierno
-    user gobierno
-    ipAllowList []  # Permite acceso desde cualquier IP (necesario para Render)
+  - type: postgres
+    name: flask-jira-db
+    plan: free
+    databaseName: gobierno
+    user: gobierno
+    ipAllowList: []
