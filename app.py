@@ -2,6 +2,7 @@
 """
 flask_jira_refactored.py
 ========================
+Refactorización de flask_jira.py para integración con Power Automate.
 
 CAMBIOS RESPECTO AL ORIGINAL
 ─────────────────────────────────────────────────────────────────
@@ -74,6 +75,7 @@ from requests.auth import HTTPBasicAuth
 from sqlalchemy import create_engine, text
 
 from dotenv import load_dotenv
+import pytz
 
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -496,8 +498,15 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
 
         fecha_fin_obj    = datetime.strptime(fecha_fin,    "%Y-%m-%d").date()
         fecha_inicio_obj = datetime.strptime(fecha_inicio, "%Y-%m-%d").date()
-        from datetime import time as dt_time
-        fecha_corte      = datetime.combine(fecha_fin_obj, dt_time(23, 59, 59))
+
+        # Construir fecha_corte como 23:59:59 hora Lima (igual que construir_dataframe
+        # convierte fechas de Jira de UTC→Lima). Se usa pytz para que PostgreSQL
+        # almacene el timestamp CON offset correcto -0500 y no reste 5h adicionales.
+        tz_lima    = pytz.timezone("America/Lima")
+        from datetime import time as _t
+        fecha_corte = tz_lima.localize(
+            datetime.combine(fecha_fin_obj, _t(23, 59, 59))
+        )
 
         resumen["fecha_corte"]    = fecha_corte
         resumen["fecha_inicio"]   = fecha_inicio_obj
@@ -667,9 +676,9 @@ def fecha_corta_es(fecha) -> str:
             fecha = datetime.strptime(fecha[:10], "%Y-%m-%d").date()
         except ValueError:
             return str(fecha)
-    if isinstance(fecha, _dt.date) and not isinstance(fecha, datetime):
-        return f"{MESES[fecha.month]} {fecha.day:02d}"
     if isinstance(fecha, (datetime, pd.Timestamp)):
+        return f"{MESES[fecha.month]} {fecha.day:02d}"
+    if isinstance(fecha, _dt.date):
         return f"{MESES[fecha.month]} {fecha.day:02d}"
     return str(fecha)
 
@@ -808,6 +817,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
+    <div class="header">
+        Estimados,<br><br>
+        Adjunto la relación de tickets TPRO Jira que se encuentran vencidos (su periodo programado ya finalizó)
+        y permanecen en estado <strong>"Programado"</strong> o <strong>"Implantación en curso"</strong>.
+        Agradeceremos su apoyo para realizar la <strong>regularización correspondiente a la brevedad posible.</strong><br>
+        Les recordamos que, según el procedimiento vigente, <strong>cada ticket debe gestionarse dentro del periodo de
+        ejecución definido en el propio TPRO</strong>, por tanto las fechas de apertura y cierre del ticket deben reflejar
+        exactamente el inicio y fin reales del trabajo. En caso de no ejecutarse, el ticket debe ser cancelado.
+        Este cumplimiento garantiza la correcta trazabilidad dentro del proceso de Gestión de Cambios.<br><br>
+        La fecha de corte de este reporte es del <strong>{{ fecha_corte }}</strong>
+    </div>
     <table class="tables-wrapper" cellpadding="0" cellspacing="0">
         <tr>
             <td class="table-section-left">{{ tabla_resumen|safe }}</td>
