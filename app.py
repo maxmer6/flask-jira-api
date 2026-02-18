@@ -2,7 +2,6 @@
 """
 flask_jira_refactored.py
 ========================
-Refactorización de flask_jira.py para integración con Power Automate.
 
 CAMBIOS RESPECTO AL ORIGINAL
 ─────────────────────────────────────────────────────────────────
@@ -497,7 +496,8 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
 
         fecha_fin_obj    = datetime.strptime(fecha_fin,    "%Y-%m-%d").date()
         fecha_inicio_obj = datetime.strptime(fecha_inicio, "%Y-%m-%d").date()
-        fecha_corte      = datetime.combine(fecha_fin_obj, datetime.max.time())
+        from datetime import time as dt_time
+        fecha_corte      = datetime.combine(fecha_fin_obj, dt_time(23, 59, 59))
 
         resumen["fecha_corte"]    = fecha_corte
         resumen["fecha_inicio"]   = fecha_inicio_obj
@@ -643,7 +643,7 @@ def _evolutivo_to_dict(df_evol: pd.DataFrame) -> List[Dict]:
     cols_fmt = []
     for c in df_evol.columns:
         if hasattr(c, "month"):
-            cols_fmt.append(f"{MESES[c.month]}-{c.day:02d}")
+            cols_fmt.append(f"{MESES[c.month]} {c.day:02d}")
         else:
             cols_fmt.append(str(c))
 
@@ -661,9 +661,17 @@ def _evolutivo_to_dict(df_evol: pd.DataFrame) -> List[Dict]:
 # ─────────────────────────────────────────────
 
 def fecha_corta_es(fecha) -> str:
+    import datetime as _dt
     if isinstance(fecha, str):
-        fecha = datetime.strptime(fecha, "%Y-%m-%d").date()
-    return f"{MESES[fecha.month]}-{fecha.day:02d}"
+        try:
+            fecha = datetime.strptime(fecha[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return str(fecha)
+    if isinstance(fecha, _dt.date) and not isinstance(fecha, datetime):
+        return f"{MESES[fecha.month]} {fecha.day:02d}"
+    if isinstance(fecha, (datetime, pd.Timestamp)):
+        return f"{MESES[fecha.month]} {fecha.day:02d}"
+    return str(fecha)
 
 
 def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
@@ -752,7 +760,7 @@ def generar_tabla_evolutivo_html(df_evol: pd.DataFrame) -> str:
 
     df_evol = df_evol.copy()
     df_evol.columns = [
-        fecha_corta_es(c) if isinstance(c, (datetime, pd.Timestamp)) else str(c)
+        fecha_corta_es(c)
         for c in df_evol.columns
     ]
     if len(df_evol.columns) > 0:
@@ -789,7 +797,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Reporte TPRO Jira</title>
 <style>
-    body { margin:0; padding:20px; font-family:Calibri,Arial,sans-serif; color:#1c1b1b; background-color:#f5f5f5; }
+    body { margin:0; padding:20px; font-family:Calibri,Arial,sans-serif; color:#1c1b1b; background-color:#ffffff; }
     .container { max-width:100%; margin:0 auto; background-color:white; padding:30px; border-radius:8px; box-shadow:0 2px 10px rgba(0,0,0,0.1); }
     .header { font-size:14px; line-height:1.6; margin-bottom:25px; color:#333; }
     .tables-wrapper { width:100%; border-collapse:collapse; }
@@ -924,7 +932,7 @@ def process_data():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
     )
     guardar = _parse_bool(params.get("guardar", False))
 
@@ -1019,7 +1027,7 @@ def process_data():
 # ║           → NO es idempotente → POST es correcto.            ║
 # ╚═══════════════════════════════════════════════════════════════╝
 # ─────────────────────────────────────────────────────────────────
-@app.route("/guardar-historico", methods=["GET","POST", "OPTIONS"])
+@app.route("/guardar-historico", methods=["POST", "OPTIONS"])
 @handle_errors
 def guardar_historico_endpoint():
     """
@@ -1043,7 +1051,7 @@ def guardar_historico_endpoint():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
     )
 
     print(f"\n{'='*55}")
@@ -1101,7 +1109,7 @@ def download_excel():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
     )
 
     print(f"\n[{datetime.now():%H:%M:%S}] GET /download-excel | {fecha_inicio} → {fecha_fin}")
@@ -1124,11 +1132,36 @@ def download_excel():
     output.seek(0)
     filename = f"Detalle_jira_{fecha_fin.replace('-', '')}.xlsx"
 
-    return send_file(
-        output,
-        download_name=filename,
-        as_attachment=True,
+    # ── Detección del cliente ──────────────────────────────────────
+    # Power Automate envía Accept: application/json → necesita Base64
+    # Navegador / curl envían Accept: */* o application/octet-stream
+    #   → recibe el binario directo para descarga normal
+    import base64
+    from flask import Response as FlaskResponse
+    accept = request.headers.get("Accept", "")
+
+    if "application/json" in accept:
+        archivo_base64 = base64.b64encode(output.read()).decode("utf-8")
+        return _ok(
+            data={
+                "filename":    filename,
+                "filecontent": archivo_base64,
+                "encoding":    "base64",
+                "mimetype":    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            },
+            message=f"Excel generado correctamente: {filename}",
+            meta={
+                "fecha_inicio": fecha_inicio,
+                "fecha_fin":    fecha_fin,
+            },
+        )
+
+    # Descarga binaria directa (navegador / Postman / curl)
+    output.seek(0)
+    return FlaskResponse(
+        output.read(),
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
