@@ -800,17 +800,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 <div class="container">
-    <div class="header">
-        Estimados,<br><br>
-        Adjunto la relación de tickets TPRO Jira que se encuentran vencidos (su periodo programado ya finalizó)
-        y permanecen en estado <strong>"Programado"</strong> o <strong>"Implantación en curso"</strong>.
-        Agradeceremos su apoyo para realizar la <strong>regularización correspondiente a la brevedad posible.</strong><br>
-        Les recordamos que, según el procedimiento vigente, <strong>cada ticket debe gestionarse dentro del periodo de
-        ejecución definido en el propio TPRO</strong>, por tanto las fechas de apertura y cierre del ticket deben reflejar
-        exactamente el inicio y fin reales del trabajo. En caso de no ejecutarse, el ticket debe ser cancelado.
-        Este cumplimiento garantiza la correcta trazabilidad dentro del proceso de Gestión de Cambios.<br><br>
-        La fecha de corte de este reporte es del <strong>{{ fecha_corte }}</strong>
-    </div>
     <table class="tables-wrapper" cellpadding="0" cellspacing="0">
         <tr>
             <td class="table-section-left">{{ tabla_resumen|safe }}</td>
