@@ -1030,7 +1030,7 @@ def process_data():
 # ║           → NO es idempotente → POST es correcto.            ║
 # ╚═══════════════════════════════════════════════════════════════╝
 # ─────────────────────────────────────────────────────────────────
-@app.route("/guardar-historico", methods=["POST", "OPTIONS"])
+@app.route("/guardar-historico", methods=["GET","POST", "OPTIONS"])
 @handle_errors
 def guardar_historico_endpoint():
     """
