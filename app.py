@@ -506,9 +506,11 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
 
         fecha_fin_obj    = datetime.strptime(fecha_fin,    "%Y-%m-%d").date()
         fecha_inicio_obj = datetime.strptime(fecha_inicio, "%Y-%m-%d").date()
-        # Fecha de corte = fin del dia en hora Lima (23:59:59 explicito)
+        # Fecha de corte = 23:59:59 naive (sin zona) para que PostgreSQL
+        # la almacene exactamente como "2026-02-18 23:59:59" sin offset.
         fecha_corte      = datetime(fecha_fin_obj.year, fecha_fin_obj.month,
-                                    fecha_fin_obj.day, 23, 59, 59)
+                                    fecha_fin_obj.day, 23, 59, 59,
+                                    tzinfo=None)  # naive = sin zona horaria
 
         resumen["fecha_corte"]    = fecha_corte
         resumen["fecha_inicio"]   = fecha_inicio_obj
@@ -589,7 +591,8 @@ def consultar_historico_evolutivo() -> pd.DataFrame:
         engine.dispose()
 
 
-def generar_evolutivo(df: pd.DataFrame, usar_bd: bool = True) -> pd.DataFrame:
+def generar_evolutivo(df: pd.DataFrame, usar_bd: bool = True,
+                      fecha_fin: str = None) -> pd.DataFrame:
     """Devuelve el DataFrame pivoteado para la tabla evolutiva."""
     if usar_bd:
         df_evol = consultar_historico_evolutivo()
@@ -601,7 +604,12 @@ def generar_evolutivo(df: pd.DataFrame, usar_bd: bool = True) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = df.copy()
-    df["fecha_corte"] = (datetime.now() - timedelta(days=1)).date()
+    # Usar fecha_fin del parámetro si está disponible; si no, ayer en Lima
+    if fecha_fin is not None:
+        fecha_corte_val = datetime.strptime(fecha_fin, "%Y-%m-%d").date()
+    else:
+        fecha_corte_val = (datetime.now(TZ_LIMA) - timedelta(days=1)).date()
+    df["fecha_corte"] = fecha_corte_val
     return (
         df.groupby(["supervisor_final", "fecha_corte"])
         .size()
@@ -994,6 +1002,8 @@ def process_data():
     df_mensual = generar_mensual(df)
 
     # ── Guardar histórico si se solicitó ─────────────────────────
+    # IMPORTANTE: guardar ANTES de generar el evolutivo para que
+    # consultar_historico_evolutivo() encuentre el snapshot recién insertado.
     resultado_guardado = {}
     if guardar:
         try:
@@ -1002,8 +1012,8 @@ def process_data():
             print(f"[{datetime.now():%H:%M:%S}] ⚠️  No se pudo guardar histórico: {exc}")
             resultado_guardado = {"guardado": False, "motivo": str(exc)}
 
-    # ── Evolutivo ─────────────────────────────────────────────────
-    df_evolutivo = generar_evolutivo(df, usar_bd=True)
+    # ── Evolutivo (se genera DESPUÉS de guardar para incluir dato de hoy) ──
+    df_evolutivo = generar_evolutivo(df, usar_bd=True, fecha_fin=fecha_fin)
 
     # ── Serializar a JSON ─────────────────────────────────────────
     tickets_json        = _df_to_records(df)
