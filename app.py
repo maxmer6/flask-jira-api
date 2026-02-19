@@ -506,16 +506,17 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
 
         fecha_fin_obj    = datetime.strptime(fecha_fin,    "%Y-%m-%d").date()
         fecha_inicio_obj = datetime.strptime(fecha_inicio, "%Y-%m-%d").date()
-        # Fecha de corte = 23:59:59 naive (sin zona) para que PostgreSQL
-        # la almacene exactamente como "2026-02-18 23:59:59" sin offset.
-        fecha_corte      = datetime(fecha_fin_obj.year, fecha_fin_obj.month,
-                                    fecha_fin_obj.day, 23, 59, 59,
-                                    tzinfo=None)  # naive = sin zona horaria
 
-        resumen["fecha_corte"]    = fecha_corte
-        resumen["fecha_inicio"]   = fecha_inicio_obj
-        resumen["fecha_fin"]      = fecha_fin_obj
-        resumen["fecha_ejecucion"] = datetime.now()
+        # Construir strings ISO explícitos para evitar que psycopg2 aplique
+        # la zona horaria del servidor al insertar en columnas TIMESTAMPTZ.
+        # Al pasar strings, PostgreSQL los interpreta como hora literal sin offset.
+        fecha_corte_str   = f"{fecha_fin} 23:59:59"
+        fecha_ejecucion_str = datetime.now(TZ_LIMA).strftime("%Y-%m-%d %H:%M:%S")
+
+        resumen["fecha_corte"]     = fecha_corte_str
+        resumen["fecha_inicio"]    = str(fecha_inicio_obj)
+        resumen["fecha_fin"]       = str(fecha_fin_obj)
+        resumen["fecha_ejecucion"] = fecha_ejecucion_str
 
         cols_finales = [
             "fecha_corte", "supervisor", "total_registros",
@@ -527,15 +528,41 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
         with engine.connect() as conn:
             conn.execute(
                 text(f"DELETE FROM {PG_SCHEMA}.{PG_TABLE_EVOLUTIVO} WHERE fecha_fin = :fd"),
-                {"fd": fecha_fin_obj},
+                {"fd": str(fecha_fin_obj)},
             )
             conn.commit()
 
-        resumen_final.to_sql(
-            PG_TABLE_EVOLUTIVO, engine,
-            schema=PG_SCHEMA, if_exists="append",
-            index=False, method="multi",
-        )
+        # INSERT fila a fila con SQL explícito y CAST a timestamp sin zona,
+        # garantizando que Postgres almacene exactamente "YYYY-MM-DD 23:59:59".
+        insert_sql = text(f"""
+            INSERT INTO {PG_SCHEMA}.{PG_TABLE_EVOLUTIVO}
+                (fecha_corte, supervisor, total_registros,
+                 total_implantacion, total_programado,
+                 fecha_inicio, fecha_fin, fecha_ejecucion)
+            VALUES (
+                CAST(:fecha_corte     AS TIMESTAMP WITHOUT TIME ZONE),
+                :supervisor,
+                :total_registros,
+                :total_implantacion,
+                :total_programado,
+                CAST(:fecha_inicio    AS DATE),
+                CAST(:fecha_fin       AS DATE),
+                CAST(:fecha_ejecucion AS TIMESTAMP WITHOUT TIME ZONE)
+            )
+        """)
+        with engine.connect() as conn:
+            for _, row in resumen_final.iterrows():
+                conn.execute(insert_sql, {
+                    "fecha_corte":      row["fecha_corte"],
+                    "supervisor":       row["supervisor"],
+                    "total_registros":  int(row["total_registros"]),
+                    "total_implantacion": int(row["total_implantacion"]),
+                    "total_programado": int(row["total_programado"]),
+                    "fecha_inicio":     row["fecha_inicio"],
+                    "fecha_fin":        row["fecha_fin"],
+                    "fecha_ejecucion":  row["fecha_ejecucion"],
+                })
+            conn.commit()
 
         n = len(resumen_final)
         print(f"[{datetime.now():%H:%M:%S}] ✅ Histórico guardado: {n} supervisores")
