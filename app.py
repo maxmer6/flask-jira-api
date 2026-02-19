@@ -428,6 +428,21 @@ def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
     return df
 
 
+def filtrar_por_fecha_fin(df: pd.DataFrame, fecha_fin: str) -> pd.DataFrame:
+    """
+    Filtra el DataFrame para excluir tickets cuya fecha_fin
+    (ya convertida a hora Lima) sea posterior al día indicado.
+    Necesario porque el JQL opera sobre UTC y puede retornar
+    tickets del día siguiente en hora Lima.
+    """
+    if df.empty:
+        return df
+    import datetime as _dt
+    limite = _dt.datetime.strptime(fecha_fin, "%Y-%m-%d")
+    limite_fin_dia = limite.replace(hour=23, minute=59, second=59)
+    return df[df["fecha_fin"] <= limite_fin_dia].copy()
+
+
 def generar_mensual(df: pd.DataFrame) -> pd.DataFrame:
     """Agrupación mensual por supervisor, registrado_por y estado."""
     if df.empty:
@@ -661,15 +676,9 @@ def _evolutivo_to_dict(df_evol: pd.DataFrame) -> List[Dict]:
 # ─────────────────────────────────────────────
 
 def fecha_corta_es(fecha) -> str:
-    import datetime as _dt
     if isinstance(fecha, str):
-        try:
-            fecha = _dt.datetime.strptime(fecha[:10], "%Y-%m-%d").date()
-        except ValueError:
-            return str(fecha)
-    if hasattr(fecha, "month") and hasattr(fecha, "day"):
-        return f"{MESES[fecha.month]} {fecha.day:02d}"
-    return str(fecha)
+        fecha = datetime.strptime(fecha, "%Y-%m-%d").date()
+    return f"{MESES[fecha.month]}-{fecha.day:02d}"
 
 
 def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
@@ -745,20 +754,6 @@ def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
             total_row = int(val_row_total.iloc[0]) if isinstance(val_row_total, pd.Series) else int(val_row_total)
             html.append(f'<td style="{style_td}background:{bg};border-left:2px solid #7fa8ba;">{total_row}</td></tr>')
 
-    # ── Fila Total General ───────────────────────────────
-    style_tg = "background:#003d5c;color:#fff;font-weight:bold;"
-    html.append("<tr>")
-    html.append(f'<td style="{style_td}{style_tg}text-align:left;padding-left:5px;">Total general</td>')
-    gran_total = 0
-    for est in estados:
-        for m in meses:
-            col_key = (m, est)
-            v = int(totales_sup[col_key].sum()) if col_key in totales_sup.columns else 0
-            gran_total += v
-            html.append(f'<td style="{style_td}{style_tg}">{v if v else ""}</td>')
-    gran_total_total = int(totales_sup["Total"].sum())
-    html.append(f'<td style="{style_td}{style_tg}border-left:2px solid #7fa8ba;">{gran_total_total}</td></tr>')
-
     html.append("</table></div>")
     return "".join(html)
 
@@ -772,7 +767,7 @@ def generar_tabla_evolutivo_html(df_evol: pd.DataFrame) -> str:
 
     df_evol = df_evol.copy()
     df_evol.columns = [
-        fecha_corta_es(c)
+        fecha_corta_es(c) if isinstance(c, (datetime, pd.Timestamp)) else str(c)
         for c in df_evol.columns
     ]
     if len(df_evol.columns) > 0:
@@ -809,8 +804,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Reporte TPRO Jira</title>
 <style>
-    body { margin:0; padding:0; font-family:Calibri,Arial,sans-serif; color:#1c1b1b; background-color:#ffffff; }
-    .container { max-width:100%; margin:0; background-color:#ffffff; padding:0; }
+    body { margin:0; padding:20px; font-family:Calibri,Arial,sans-serif; color:#1c1b1b; background-color:#f5f5f5; }
+    .container { max-width:100%; margin:0 auto; background-color:white; padding:30px; border-radius:8px; box-shadow:0 2px 10px rgba(0,0,0,0.1); }
     .header { font-size:14px; line-height:1.6; margin-bottom:25px; color:#333; }
     .tables-wrapper { width:100%; border-collapse:collapse; }
     .tables-wrapper td { vertical-align:top; padding:0 10px; }
@@ -955,7 +950,7 @@ def process_data():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
     )
     guardar = _parse_bool(params.get("guardar", False))
 
@@ -980,6 +975,7 @@ def process_data():
 
     # ── Procesamiento ─────────────────────────────────────────────
     df         = construir_dataframe(issues)
+    df         = filtrar_por_fecha_fin(df, fecha_fin)
     df_mensual = generar_mensual(df)
 
     # ── Guardar histórico si se solicitó ─────────────────────────
@@ -1074,7 +1070,7 @@ def guardar_historico_endpoint():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
     )
 
     print(f"\n{'='*55}")
@@ -1092,6 +1088,7 @@ def guardar_historico_endpoint():
         )
 
     df              = construir_dataframe(issues)
+    df              = filtrar_por_fecha_fin(df, fecha_fin)
     resultado_bd    = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
 
     return _ok(
@@ -1132,7 +1129,7 @@ def download_excel():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
     )
 
     print(f"\n[{datetime.now():%H:%M:%S}] GET /download-excel | {fecha_inicio} → {fecha_fin}")
@@ -1143,6 +1140,7 @@ def download_excel():
         return _err("No hay datos para exportar", status=404)
 
     df           = construir_dataframe(issues)
+    df           = filtrar_por_fecha_fin(df, fecha_fin)
     df_mensual   = generar_mensual(df)
     df_evolutivo = generar_evolutivo(df, usar_bd=True)
 
