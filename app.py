@@ -540,7 +540,7 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
                  total_implantacion, total_programado,
                  fecha_inicio, fecha_fin, fecha_ejecucion)
             VALUES (
-                CAST(:fecha_corte     AS TIMESTAMP WITHOUT TIME ZONE),
+                CAST(:fecha_corte     AS TIMESTAMP WITHOUT TIME ZONE) AT TIME ZONE 'America/Lima',
                 :supervisor,
                 :total_registros,
                 :total_implantacion,
