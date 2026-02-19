@@ -745,7 +745,7 @@ def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
             total_row = int(val_row_total.iloc[0]) if isinstance(val_row_total, pd.Series) else int(val_row_total)
             html.append(f'<td style="{style_td}background:{bg};border-left:2px solid #7fa8ba;">{total_row}</td></tr>')
 
-    # ── Fila Total General ───────────────────────────────────────
+    # ── Fila Total General ───────────────────────────────
     style_tg = "background:#003d5c;color:#fff;font-weight:bold;"
     html.append("<tr>")
     html.append(f'<td style="{style_td}{style_tg}text-align:left;padding-left:5px;">Total general</td>')
@@ -754,10 +754,10 @@ def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
         for m in meses:
             col_key = (m, est)
             v = int(totales_sup[col_key].sum()) if col_key in totales_sup.columns else 0
-            gran_total_col = v
-            html.append(f'<td style="{style_td}{style_tg}">{gran_total_col if gran_total_col else ""}</td>')
-    gran_total = int(totales_sup["Total"].sum())
-    html.append(f'<td style="{style_td}{style_tg}border-left:2px solid #7fa8ba;">{gran_total}</td></tr>')
+            gran_total += v
+            html.append(f'<td style="{style_td}{style_tg}">{v if v else ""}</td>')
+    gran_total_total = int(totales_sup["Total"].sum())
+    html.append(f'<td style="{style_td}{style_tg}border-left:2px solid #7fa8ba;">{gran_total_total}</td></tr>')
 
     html.append("</table></div>")
     return "".join(html)
