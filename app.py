@@ -75,7 +75,6 @@ from requests.auth import HTTPBasicAuth
 from sqlalchemy import create_engine, text
 
 from dotenv import load_dotenv
-import pytz
 
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
@@ -343,7 +342,7 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
     jql_query = (
         f'project = TPRO '
         f'AND (status = "Programado" OR status = "Implantación en Curso") '
-        f'AND {CF_FECHA_FIN} >= "{fecha_inicio} 00:00"'
+        f'AND {CF_FECHA_FIN} >= "{fecha_inicio} 00:00" '
         f'AND {CF_FECHA_FIN} <= "{fecha_fin} 23:59"'
     )
     print(f"[{datetime.now():%H:%M:%S}] JQL: {jql_query}")
@@ -498,15 +497,7 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
 
         fecha_fin_obj    = datetime.strptime(fecha_fin,    "%Y-%m-%d").date()
         fecha_inicio_obj = datetime.strptime(fecha_inicio, "%Y-%m-%d").date()
-
-        # Construir fecha_corte como 23:59:59 hora Lima (igual que construir_dataframe
-        # convierte fechas de Jira de UTC→Lima). Se usa pytz para que PostgreSQL
-        # almacene el timestamp CON offset correcto -0500 y no reste 5h adicionales.
-        tz_lima    = pytz.timezone("America/Lima")
-        from datetime import time as _t
-        fecha_corte = tz_lima.localize(
-            datetime.combine(fecha_fin_obj, _t(23, 59, 59))
-        )
+        fecha_corte      = datetime.combine(fecha_fin_obj, datetime.max.time())
 
         resumen["fecha_corte"]    = fecha_corte
         resumen["fecha_inicio"]   = fecha_inicio_obj
@@ -652,7 +643,7 @@ def _evolutivo_to_dict(df_evol: pd.DataFrame) -> List[Dict]:
     cols_fmt = []
     for c in df_evol.columns:
         if hasattr(c, "month"):
-            cols_fmt.append(f"{MESES[c.month]} {c.day:02d}")
+            cols_fmt.append(f"{MESES[c.month]}-{c.day:02d}")
         else:
             cols_fmt.append(str(c))
 
@@ -670,17 +661,9 @@ def _evolutivo_to_dict(df_evol: pd.DataFrame) -> List[Dict]:
 # ─────────────────────────────────────────────
 
 def fecha_corta_es(fecha) -> str:
-    import datetime as _dt
     if isinstance(fecha, str):
-        try:
-            fecha = datetime.strptime(fecha[:10], "%Y-%m-%d").date()
-        except ValueError:
-            return str(fecha)
-    if isinstance(fecha, (datetime, pd.Timestamp)):
-        return f"{MESES[fecha.month]} {fecha.day:02d}"
-    if isinstance(fecha, _dt.date):
-        return f"{MESES[fecha.month]} {fecha.day:02d}"
-    return str(fecha)
+        fecha = datetime.strptime(fecha, "%Y-%m-%d").date()
+    return f"{MESES[fecha.month]}-{fecha.day:02d}"
 
 
 def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
@@ -769,7 +752,7 @@ def generar_tabla_evolutivo_html(df_evol: pd.DataFrame) -> str:
 
     df_evol = df_evol.copy()
     df_evol.columns = [
-        fecha_corta_es(c)
+        fecha_corta_es(c) if isinstance(c, (datetime, pd.Timestamp)) else str(c)
         for c in df_evol.columns
     ]
     if len(df_evol.columns) > 0:
@@ -806,7 +789,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Reporte TPRO Jira</title>
 <style>
-    body { margin:0; padding:20px; font-family:Calibri,Arial,sans-serif; color:#1c1b1b; background-color:#ffffff; }
+    body { margin:0; padding:20px; font-family:Calibri,Arial,sans-serif; color:#1c1b1b; background-color:#f5f5f5; }
     .container { max-width:100%; margin:0 auto; background-color:white; padding:30px; border-radius:8px; box-shadow:0 2px 10px rgba(0,0,0,0.1); }
     .header { font-size:14px; line-height:1.6; margin-bottom:25px; color:#333; }
     .tables-wrapper { width:100%; border-collapse:collapse; }
@@ -952,7 +935,7 @@ def process_data():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
+        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
     )
     guardar = _parse_bool(params.get("guardar", False))
 
@@ -1071,7 +1054,7 @@ def guardar_historico_endpoint():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
+        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
     )
 
     print(f"\n{'='*55}")
@@ -1129,7 +1112,7 @@ def download_excel():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")), "fin"
+        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
     )
 
     print(f"\n[{datetime.now():%H:%M:%S}] GET /download-excel | {fecha_inicio} → {fecha_fin}")
