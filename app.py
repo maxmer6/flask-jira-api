@@ -343,8 +343,8 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
     jql_query = (
         f'project = TPRO '
         f'AND (status = "Programado" OR status = "Implantación en Curso") '
-        f'AND {CF_FECHA_FIN} >= "{fecha_inicio}" '
-        f'AND {CF_FECHA_FIN} <= "{fecha_fin}"'
+        f'AND {CF_FECHA_FIN} >= "{fecha_inicio}" 00:00'
+        f'AND {CF_FECHA_FIN} <= "{fecha_fin}" 23:59'
     )
     print(f"[{datetime.now():%H:%M:%S}] JQL: {jql_query}")
 
