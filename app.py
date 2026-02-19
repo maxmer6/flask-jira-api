@@ -135,6 +135,9 @@ JIRA_FIELDS = [
 MESES = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun",
          "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
 
+# Zona horaria de Lima (UTC-5) — usada en todos los cálculos de fecha
+TZ_LIMA = timezone(timedelta(hours=-5))
+
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN POSTGRESQL
@@ -304,7 +307,20 @@ def _get_params() -> Dict:
 # LÓGICA DE NEGOCIO — sin cambios funcionales respecto al original
 # ═══════════════════════════════════════════════════════════════
 
-def get_value(field: Any) -> Optional[str]:
+def _hoy_lima() -> "datetime":
+    """Devuelve el datetime actual en la zona horaria de Lima (UTC-5)."""
+    return datetime.now(TZ_LIMA)
+
+
+def _ayer_lima_str() -> str:
+    """
+    Devuelve la fecha de ayer en Lima como string 'YYYY-MM-DD'.
+    Garantiza que los reportes automáticos siempre cierren en T-1.
+    """
+    return (_hoy_lima() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+
     """Extrae el valor de un campo Jira (dict, string o None)."""
     if field is None:
         return None
@@ -337,15 +353,27 @@ def calcular_supervisor_final(row: pd.Series) -> str:
 def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
     """
     Consulta paginada a Jira usando nextPageToken.
-    GET a Jira es correcto: solo LEEMOS datos, no mutamos nada en Jira.
+
+    Nota de zona horaria:
+      Jira Cloud almacena los custom date-time fields en UTC.
+      Lima es UTC-5, por lo que el final del día en Lima (23:59:59)
+      equivale a las 04:59:59 UTC del día SIGUIENTE.
+      Para no perder registros de madrugada, la cota superior en JQL
+      se amplía al día siguiente a las 05:00 UTC y el recorte exacto
+      se realiza en Python sobre el DataFrame (ya convertido a Lima).
     """
+    # fecha_fin en Lima → día siguiente a las 05:00 UTC cubre hasta 23:59:59 Lima
+    fecha_fin_dt      = datetime.strptime(fecha_fin, "%Y-%m-%d")
+    fecha_fin_jql_dt  = fecha_fin_dt + timedelta(days=1)   # día siguiente
+    fecha_fin_jql     = fecha_fin_jql_dt.strftime("%Y-%m-%d")
+
     jql_query = (
         f'project = TPRO '
         f'AND (status = "Programado" OR status = "Implantación en Curso") '
         f'AND {CF_FECHA_FIN} >= "{fecha_inicio} 00:00" '
-        f'AND {CF_FECHA_FIN} <= "{fecha_fin} 23:59"'
+        f'AND {CF_FECHA_FIN} <= "{fecha_fin_jql} 04:59"'   # 04:59 UTC = 23:59 Lima
     )
-    print(f"[{datetime.now():%H:%M:%S}] JQL: {jql_query}")
+    print(f"[{datetime.now(TZ_LIMA):%H:%M:%S}] JQL: {jql_query}")
 
     url        = f"{JIRA_URL}{API_ENDPOINT}"
     all_issues = []
@@ -394,8 +422,15 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
     return all_issues
 
 
-def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Transforma la lista cruda de issues Jira a un DataFrame normalizado."""
+def construir_dataframe(issues: List[Dict[str, Any]],
+                        fecha_fin: Optional[str] = None) -> pd.DataFrame:
+    """
+    Transforma la lista cruda de issues Jira a un DataFrame normalizado.
+
+    El parámetro `fecha_fin` (YYYY-MM-DD, en hora Lima) se usa para
+    descartar cualquier registro cuya fecha_fin supere el límite del día,
+    eliminando falsos positivos causados por el desfase UTC↔Lima en la JQL.
+    """
     rows = []
     for issue in issues:
         try:
@@ -423,6 +458,19 @@ def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
                 .dt.tz_convert("America/Lima")
                 .dt.tz_localize(None)
             )
+
+        # ── Filtro de corte estricto en hora Lima ──────────────────────
+        # La JQL amplía el rango un día para capturar la madrugada Lima;
+        # aquí recortamos exactamente hasta las 23:59:59 del día pedido.
+        if fecha_fin is not None:
+            fecha_corte_lima = datetime.strptime(fecha_fin, "%Y-%m-%d").replace(
+                hour=23, minute=59, second=59, microsecond=999999
+            )
+            df = df[
+                df["fecha_fin"].isna() | (df["fecha_fin"] <= fecha_corte_lima)
+            ]
+        # ──────────────────────────────────────────────────────────────
+
         df["supervisor_final"] = df.apply(calcular_supervisor_final, axis=1)
 
     return df
@@ -497,7 +545,11 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
 
         fecha_fin_obj    = datetime.strptime(fecha_fin,    "%Y-%m-%d").date()
         fecha_inicio_obj = datetime.strptime(fecha_inicio, "%Y-%m-%d").date()
-        fecha_corte      = datetime.combine(fecha_fin_obj, datetime.max.time())
+        # Fecha de corte = fin del día en hora Lima (23:59:59)
+        fecha_corte      = datetime(
+            fecha_fin_obj.year, fecha_fin_obj.month, fecha_fin_obj.day,
+            23, 59, 59
+        )
 
         resumen["fecha_corte"]    = fecha_corte
         resumen["fecha_inicio"]   = fecha_inicio_obj
@@ -950,19 +1002,18 @@ def process_data():
 
     params = _get_params()
 
-    # ── Validación explícita de tipos ─────────────────────────────
     fecha_inicio = _parse_date(
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", _ayer_lima_str()), "fin"  # Por defecto: ayer en hora Lima
     )
     guardar = _parse_bool(params.get("guardar", False))
 
     print(f"\n{'='*55}")
-    print(f"[{datetime.now():%H:%M:%S}] GET /process-data")
-    print(f"[{datetime.now():%H:%M:%S}] Rango  : {fecha_inicio} → {fecha_fin}")
-    print(f"[{datetime.now():%H:%M:%S}] Guardar: {guardar}")
+    print(f"[{datetime.now(TZ_LIMA):%H:%M:%S}] GET /process-data")
+    print(f"[{datetime.now(TZ_LIMA):%H:%M:%S}] Rango  : {fecha_inicio} → {fecha_fin}")
+    print(f"[{datetime.now(TZ_LIMA):%H:%M:%S}] Guardar: {guardar}")
     print(f"{'='*55}\n")
 
     # ── Consulta a Jira (GET, solo lectura) ───────────────────────
@@ -976,10 +1027,10 @@ def process_data():
             status=404,
         )
 
-    print(f"[{datetime.now():%H:%M:%S}] Total issues: {len(issues)}")
+    print(f"[{datetime.now(TZ_LIMA):%H:%M:%S}] Total issues: {len(issues)}")
 
     # ── Procesamiento ─────────────────────────────────────────────
-    df         = construir_dataframe(issues)
+    df         = construir_dataframe(issues, fecha_fin=fecha_fin)
     df_mensual = generar_mensual(df)
 
     # ── Guardar histórico si se solicitó ─────────────────────────
@@ -1074,12 +1125,12 @@ def guardar_historico_endpoint():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", _ayer_lima_str()), "fin"  # Por defecto: ayer en hora Lima
     )
 
     print(f"\n{'='*55}")
-    print(f"[{datetime.now():%H:%M:%S}] POST /guardar-historico")
-    print(f"[{datetime.now():%H:%M:%S}] Rango: {fecha_inicio} → {fecha_fin}")
+    print(f"[{datetime.now(TZ_LIMA):%H:%M:%S}] POST /guardar-historico")
+    print(f"[{datetime.now(TZ_LIMA):%H:%M:%S}] Rango: {fecha_inicio} → {fecha_fin}")
     print(f"{'='*55}\n")
 
     issues = obtener_issues(fecha_inicio, fecha_fin)
@@ -1091,7 +1142,7 @@ def guardar_historico_endpoint():
             status=404,
         )
 
-    df              = construir_dataframe(issues)
+    df              = construir_dataframe(issues, fecha_fin=fecha_fin)
     resultado_bd    = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
 
     return _ok(
@@ -1132,17 +1183,17 @@ def download_excel():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", datetime.now().strftime("%Y-%m-%d")), "fin"
+        params.get("fin", _ayer_lima_str()), "fin"  # Por defecto: ayer en hora Lima
     )
 
-    print(f"\n[{datetime.now():%H:%M:%S}] GET /download-excel | {fecha_inicio} → {fecha_fin}")
+    print(f"\n[{datetime.now(TZ_LIMA):%H:%M:%S}] GET /download-excel | {fecha_inicio} → {fecha_fin}")
 
     issues = obtener_issues(fecha_inicio, fecha_fin)
 
     if not issues:
         return _err("No hay datos para exportar", status=404)
 
-    df           = construir_dataframe(issues)
+    df           = construir_dataframe(issues, fecha_fin=fecha_fin)
     df_mensual   = generar_mensual(df)
     df_evolutivo = generar_evolutivo(df, usar_bd=True)
 
