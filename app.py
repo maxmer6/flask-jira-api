@@ -586,9 +586,12 @@ def consultar_historico_evolutivo() -> pd.DataFrame:
         return pd.DataFrame()
 
     try:
+        # Agrupamos por fecha_fin (tipo DATE, sin zona horaria) en lugar de
+        # fecha_corte::DATE, porque fecha_corte es TIMESTAMPTZ y su conversión
+        # a DATE en UTC puede caer en el día siguiente (+5h Lima → UTC).
         query = f"""
         WITH ultimas_fechas AS (
-            SELECT DISTINCT fecha_corte::DATE AS fecha
+            SELECT DISTINCT fecha_fin::DATE AS fecha
             FROM {PG_SCHEMA}.{PG_TABLE_EVOLUTIVO}
             ORDER BY fecha DESC
             LIMIT 5
@@ -597,7 +600,7 @@ def consultar_historico_evolutivo() -> pd.DataFrame:
                fecha_fin::DATE AS fecha_orden,
                total_registros
         FROM {PG_SCHEMA}.{PG_TABLE_EVOLUTIVO}
-        WHERE fecha_corte::DATE IN (SELECT fecha FROM ultimas_fechas)
+        WHERE fecha_fin::DATE IN (SELECT fecha FROM ultimas_fechas)
         ORDER BY supervisor, fecha_fin
         """
         df = pd.read_sql(query, engine)
@@ -1192,7 +1195,7 @@ def download_excel():
 
     df           = construir_dataframe(issues)
     df_mensual   = generar_mensual(df)
-    df_evolutivo = generar_evolutivo(df, usar_bd=True)
+    df_evolutivo = generar_evolutivo(df, usar_bd=True, fecha_fin=fecha_fin)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
