@@ -1006,12 +1006,9 @@ def process_data():
     fecha_fin = _parse_date(
         params.get("fin", _ayer_lima_str()), "fin"  # Por defecto: ayer en hora Lima
     )
-    guardar = _parse_bool(params.get("guardar", False))
-
     print(f"\n{'='*55}")
     print(f"[{datetime.now():%H:%M:%S}] GET /process-data")
     print(f"[{datetime.now():%H:%M:%S}] Rango  : {fecha_inicio} → {fecha_fin}")
-    print(f"[{datetime.now():%H:%M:%S}] Guardar: {guardar}")
     print(f"{'='*55}\n")
 
     # ── Consulta a Jira (GET, solo lectura) ───────────────────────
@@ -1031,16 +1028,16 @@ def process_data():
     df         = construir_dataframe(issues)
     df_mensual = generar_mensual(df)
 
-    # ── Guardar histórico si se solicitó ─────────────────────────
-    # IMPORTANTE: guardar ANTES de generar el evolutivo para que
-    # consultar_historico_evolutivo() encuentre el snapshot recién insertado.
+    # ── Guardar histórico SIEMPRE (antes del evolutivo) ──────────
+    # Se guarda en BD en cada ejecución para mantener el histórico
+    # actualizado. El DELETE previo en guardar_historico_evolutivo
+    # evita duplicados para la misma fecha_fin.
     resultado_guardado = {}
-    if guardar:
-        try:
-            resultado_guardado = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
-        except Exception as exc:
-            print(f"[{datetime.now():%H:%M:%S}] ⚠️  No se pudo guardar histórico: {exc}")
-            resultado_guardado = {"guardado": False, "motivo": str(exc)}
+    try:
+        resultado_guardado = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
+    except Exception as exc:
+        print(f"[{datetime.now():%H:%M:%S}] ⚠️  No se pudo guardar histórico: {exc}")
+        resultado_guardado = {"guardado": False, "motivo": str(exc)}
 
     # ── Evolutivo (se genera DESPUÉS de guardar para incluir dato de hoy) ──
     df_evolutivo = generar_evolutivo(df, usar_bd=True, fecha_fin=fecha_fin)
@@ -1085,7 +1082,6 @@ def process_data():
             "total_supervisores": int(df["supervisor_final"].nunique()) if not df.empty else 0,
             "fecha_inicio":      fecha_inicio,
             "fecha_fin":         fecha_fin,
-            "guardar_solicitado": guardar,
         },
     )
 
