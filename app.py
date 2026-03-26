@@ -126,10 +126,15 @@ CF_FECHA_INICIO = "customfield_11363"
 CF_SUPERVISOR   = "customfield_11451"
 CF_FECHA_COMITE = "customfield_11673"
 CF_TIPO_VENTANA = "customfield_10486"
+CF_REGION       = "customfield_10952"
+CF_GRUPO_LOCALIDAD = "customfield_11533"
+CF_LOCALIDAD    = "customfield_11533"
+CF_EMPRESA_EJECUTOR = "customfield_11415"
 
 JIRA_FIELDS = [
     "summary", "status", "creator",
-    CF_FECHA_INICIO, CF_FECHA_FIN, CF_SUPERVISOR, CF_FECHA_COMITE, CF_TIPO_VENTANA,
+    CF_FECHA_INICIO, CF_FECHA_FIN, CF_SUPERVISOR, CF_FECHA_COMITE, 
+    CF_TIPO_VENTANA,CF_REGION,CF_GRUPO_LOCALIDAD,CF_EMPRESA_EJECUTOR,
 ]
 
 MESES = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun",
@@ -321,10 +326,61 @@ def get_value(field: Any) -> Optional[str]:
         return None
     if isinstance(field, dict):
         return field.get("value") or field.get("displayName") or field.get("name")
-    return field
+    return str(field)
 
 
-def calcular_supervisor_final(row: pd.Series) -> str:
+
+
+def get_cascading_parent(field: Any) -> Optional[str]:
+    """
+    Extrae el valor del NIVEL PADRE de un campo Cascading Select de Jira.
+
+    Estructura JSON esperada:
+        {
+            "value": "PARCACHATA",          ← devuelve esto
+            "id":    "81928",
+            "child": { "value": "APURIMAC - COTARUSE", "id": "81929" }
+        }
+
+    Casos seguros (nunca lanza KeyError ni AttributeError):
+      • field es None          → None
+      • field no es dict       → None
+      • "value" no existe      → None  (field.get() retorna None por defecto)
+    """
+    if not isinstance(field, dict):
+        return None
+    return field.get("value")
+
+
+def get_cascading_child(field: Any) -> Optional[str]:
+    """
+    Extrae el valor del NIVEL HIJO de un campo Cascading Select de Jira.
+
+    Estructura JSON esperada:
+        {
+            "value": "PARCACHATA",
+            "id":    "81928",
+            "child": {
+                "value": "APURIMAC - COTARUSE",  ← devuelve esto
+                "id":    "81929"
+            }
+        }
+
+    Casos seguros (nunca lanza KeyError ni AttributeError):
+      • field es None                      → None
+      • field no es dict                   → None
+      • "child" no existe en el dict       → None  (ticket sin nivel hijo seleccionado)
+      • "child" existe pero no es dict     → None  (dato inesperado, defensivo)
+      • "child" existe pero sin "value"    → None
+    """
+    if not isinstance(field, dict):
+        return None
+    child = field.get("child")          # None si el usuario no eligió nivel hijo
+    if not isinstance(child, dict):
+        return None
+    return child.get("value")
+    
+    def calcular_supervisor_final(row: pd.Series) -> str:
     """Aplica las reglas de negocio para determinar el supervisor final."""
     resumen       = row.get("resumen",       "") or ""
     supervisor    = row.get("supervisor",    "") or ""
@@ -405,6 +461,8 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
     return all_issues
 
 
+
+
 def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
     """Transforma la lista cruda de issues Jira a un DataFrame normalizado."""
     rows = []
@@ -421,6 +479,10 @@ def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
                 "supervisor":             get_value(f.get(CF_SUPERVISOR)),
                 "fecha_comite":           f.get(CF_FECHA_COMITE),
                 "registrado_por":         get_value(f.get("creator")),
+                "region":                 get_value(f.get(CF_REGION)),
+                "grupo_localidad":        get_cascading_parent(localidad_raw),  
+                "localidad":              get_cascading_child(localidad_raw),   
+                "empresa_ejecutor":       f.get(CF_EMPRESA_EJECUTOR),
             })
         except Exception as exc:
             print(f"[{datetime.now():%H:%M:%S}] Error procesando {issue.get('key')}: {exc}")
