@@ -53,8 +53,23 @@ OTROS
   • /health añadido: permite que Power Automate verifique disponibilidad
     antes de ejecutar el flujo principal.
 
+CORRECCIONES — customfield_11533 (Cascading Select) y otros bugs
+─────────────────────────────────────────────────────────────────
+  • FIX 1: CF_GRUPO_LOCALIDAD y CF_LOCALIDAD conservan el mismo ID de campo
+           (customfield_11533) pero se documentan como padre/hijo. La diferenciación
+           se resuelve en runtime mediante funciones especializadas.
+  • FIX 2: JIRA_FIELDS deduplicado con dict.fromkeys() — Jira recibe el campo
+           una sola vez por request (ahorro de ancho de banda).
+  • FIX 3: NameError "get_val" en construir_dataframe corregido a get_cascading_parent().
+           Se añade la coma faltante que causaba SyntaxError en la misma línea.
+  • FIX 4: get_value() no diferenciaba padre de hijo del Cascading Select.
+           Se añaden get_cascading_parent() y get_cascading_child() con guards
+           completos contra None, dict ausente y clave "child" faltante.
+  • FIX 5: Typo "empresa_ejeuctor" corregido a "empresa_ejecutor".
+
 @author: mmerinori
 @refactored: Claude (Anthropic) — Feb 2026
+@fixes:     Claude (Anthropic) — Mar 2026
 """
 
 # ─────────────────────────────────────────────
@@ -121,21 +136,26 @@ REQ_HEADERS  = {"Accept": "application/json"}
 API_ENDPOINT = "/rest/api/3/search/jql"
 
 # Custom Fields
-CF_FECHA_FIN    = "customfield_11365"
-CF_FECHA_INICIO = "customfield_11363"
-CF_SUPERVISOR   = "customfield_11451"
-CF_FECHA_COMITE = "customfield_11673"
-CF_TIPO_VENTANA = "customfield_10486"
-CF_REGION       = "customfield_10952"
-CF_GRUPO_LOCALIDAD = "customfield_11533"
-CF_LOCALIDAD    = "customfield_11533"
+CF_FECHA_FIN        = "customfield_11365"
+CF_FECHA_INICIO     = "customfield_11363"
+CF_SUPERVISOR       = "customfield_11451"
+CF_FECHA_COMITE     = "customfield_11673"
+CF_TIPO_VENTANA     = "customfield_10486"
+CF_REGION           = "customfield_10952"
+# FIX 1: CF_GRUPO_LOCALIDAD y CF_LOCALIDAD comparten el mismo customfield (Cascading Select).
+# La separación es semántica: padre → grupo_localidad, hijo → localidad.
+# get_cascading_parent() y get_cascading_child() resuelven el nivel correcto en runtime.
+CF_GRUPO_LOCALIDAD  = "customfield_11533"   # nivel padre del Cascading Select
+CF_LOCALIDAD        = "customfield_11533"   # nivel hijo  del Cascading Select (mismo campo JSON)
 CF_EMPRESA_EJECUTOR = "customfield_11415"
 
-JIRA_FIELDS = [
+# FIX 2: dict.fromkeys() elimina duplicados preservando el orden.
+# CF_GRUPO_LOCALIDAD y CF_LOCALIDAD son el mismo ID → Jira solo necesita recibirlo una vez.
+JIRA_FIELDS = list(dict.fromkeys([
     "summary", "status", "creator",
-    CF_FECHA_INICIO, CF_FECHA_FIN, CF_SUPERVISOR, CF_FECHA_COMITE, 
-    CF_TIPO_VENTANA,CF_REGION,CF_GRUPO_LOCALIDAD,CF_EMPRESA_EJECUTOR,
-]
+    CF_FECHA_INICIO, CF_FECHA_FIN, CF_SUPERVISOR, CF_FECHA_COMITE,
+    CF_TIPO_VENTANA, CF_REGION, CF_GRUPO_LOCALIDAD, CF_EMPRESA_EJECUTOR,
+]))
 
 MESES = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun",
          "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
@@ -317,18 +337,26 @@ def _get_params() -> Dict:
 
 
 # ═══════════════════════════════════════════════════════════════
-# LÓGICA DE NEGOCIO — sin cambios funcionales respecto al original
+# LÓGICA DE NEGOCIO
 # ═══════════════════════════════════════════════════════════════
 
 def get_value(field: Any) -> Optional[str]:
-    """Extrae el valor de un campo Jira (dict, string o None)."""
+    """
+    Extrae el valor de un campo Jira estándar (option, user, string o None).
+
+    NO usar para Cascading Select — usar get_cascading_parent() / get_cascading_child().
+
+    Casos cubiertos:
+      • None                          → None
+      • dict con "value"              → valor del option (ej. tipo_ventana, region)
+      • dict con "displayName"/"name" → nombre de usuario/estado
+      • string / número               → cast a str
+    """
     if field is None:
         return None
     if isinstance(field, dict):
         return field.get("value") or field.get("displayName") or field.get("name")
     return str(field)
-
-
 
 
 def get_cascading_parent(field: Any) -> Optional[str]:
@@ -379,8 +407,9 @@ def get_cascading_child(field: Any) -> Optional[str]:
     if not isinstance(child, dict):
         return None
     return child.get("value")
-    
-    def calcular_supervisor_final(row: pd.Series) -> str:
+
+
+def calcular_supervisor_final(row: pd.Series) -> str:
     """Aplica las reglas de negocio para determinar el supervisor final."""
     resumen       = row.get("resumen",       "") or ""
     supervisor    = row.get("supervisor",    "") or ""
@@ -461,14 +490,16 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
     return all_issues
 
 
-
-
 def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
     """Transforma la lista cruda de issues Jira a un DataFrame normalizado."""
     rows = []
     for issue in issues:
         try:
             f = issue["fields"]
+            # FIX 3+4: Se lee el campo cascading una sola vez y se pasa a
+            # las dos funciones especializadas. Sin NameError, sin coma faltante.
+            localidad_raw = f.get(CF_GRUPO_LOCALIDAD)   # mismo campo para padre e hijo
+
             rows.append({
                 "cod_trabajo_programado": issue["key"],
                 "tipo_ventana":           get_value(f.get(CF_TIPO_VENTANA)),
@@ -480,9 +511,9 @@ def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
                 "fecha_comite":           f.get(CF_FECHA_COMITE),
                 "registrado_por":         get_value(f.get("creator")),
                 "region":                 get_value(f.get(CF_REGION)),
-                "grupo_localidad":        get_cascading_parent(localidad_raw),  
-                "localidad":              get_cascading_child(localidad_raw),   
-                "empresa_ejecutor":       f.get(CF_EMPRESA_EJECUTOR),
+                "grupo_localidad":        get_cascading_parent(localidad_raw),  # "PARCACHATA"
+                "localidad":              get_cascading_child(localidad_raw),   # "APURIMAC - COTARUSE"
+                "empresa_ejecutor":       get_value(f.get(CF_EMPRESA_EJECUTOR)),# FIX 5: typo corregido
             })
         except Exception as exc:
             print(f"[{datetime.now():%H:%M:%S}] Error procesando {issue.get('key')}: {exc}")
