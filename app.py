@@ -1312,15 +1312,15 @@ def download_excel():
     # Columnas con texto largo se limitan para evitar hojas ilegibles;
     # el resto se autoajusta al contenido real hasta un máximo de 50.
     ANCHO_MAX = {
-        "resumen":          55,
-        "supervisor":       38,
+        "resumen":          45,
+        "supervisor":       35,
         "registrado_por":   30,
-        "localidad":        38,
-        "empresa_ejecutor": 35,
-        "supervisor_final": 38,
+        "localidad":        35,
+        "empresa_ejecutor": 32,
+        "supervisor_final": 35,
 
     }
-    ANCHO_MIN = 12   # ninguna columna mas angosta que esto
+    ANCHO_MIN = 8   # ninguna columna mas angosta que esto
 
     def _autofit_sheet(ws):
         """
