@@ -1292,19 +1292,19 @@ def download_excel():
     # si en algún entorno falta una columna por configuración).
     COLUMNAS_DETALLE = [
         "cod_trabajo_programado",
+        "tipo_ventana",
         "estado",
         "resumen",
         "fecha_inicio",
         "fecha_fin",
         "fecha_comite",
-        "supervisor_final",       # supervisor con reglas de negocio aplicadas
         "supervisor",             # supervisor original de Jira
         "registrado_por",
         "region",
         "grupo_localidad",        # NUEVO: nivel padre del Cascading Select
         "localidad",              # NUEVO: nivel hijo  del Cascading Select
         "empresa_ejecutor",       # NUEVO
-        "tipo_ventana",           # NUEVO
+        "supervisor_final",       # supervisor con reglas de negocio aplicadas
     ]
     cols_presentes = [c for c in COLUMNAS_DETALLE if c in df.columns]
 
@@ -1312,12 +1312,13 @@ def download_excel():
     # Columnas con texto largo se limitan para evitar hojas ilegibles;
     # el resto se autoajusta al contenido real hasta un máximo de 50.
     ANCHO_MAX = {
-        "resumen":          60,
-        "supervisor_final": 40,
-        "supervisor":       40,
-        "registrado_por":   35,
-        "localidad":        40,
-        "empresa_ejecutor": 40,
+        "resumen":          55,
+        "supervisor":       38,
+        "registrado_por":   30,
+        "localidad":        38,
+        "empresa_ejecutor": 35,
+        "supervisor_final": 38,
+
     }
     ANCHO_MIN = 12   # ninguna columna mas angosta que esto
 
