@@ -1286,11 +1286,79 @@ def download_excel():
     df_mensual   = generar_mensual(df)
     df_evolutivo = generar_evolutivo(df, usar_bd=True, fecha_fin=fecha_fin)
 
+    # Columnas de la hoja Detalle — orden explícito garantiza que los campos
+    # nuevos aparezcan aunque el DataFrame tenga columnas extra o distinto orden.
+    # Solo se incluyen las columnas que realmente existen en el df (evita KeyError
+    # si en algún entorno falta una columna por configuración).
+    COLUMNAS_DETALLE = [
+        "cod_trabajo_programado",
+        "estado",
+        "resumen",
+        "fecha_inicio",
+        "fecha_fin",
+        "fecha_comite",
+        "supervisor_final",       # supervisor con reglas de negocio aplicadas
+        "supervisor",             # supervisor original de Jira
+        "registrado_por",
+        "region",
+        "grupo_localidad",        # NUEVO: nivel padre del Cascading Select
+        "localidad",              # NUEVO: nivel hijo  del Cascading Select
+        "empresa_ejecutor",       # NUEVO
+        "tipo_ventana",           # NUEVO
+    ]
+    cols_presentes = [c for c in COLUMNAS_DETALLE if c in df.columns]
+
+    # ── Anchos máximos por columna (en caracteres) ─────────────────
+    # Columnas con texto largo se limitan para evitar hojas ilegibles;
+    # el resto se autoajusta al contenido real hasta un máximo de 50.
+    ANCHO_MAX = {
+        "resumen":          60,
+        "supervisor_final": 40,
+        "supervisor":       40,
+        "registrado_por":   35,
+        "localidad":        40,
+        "empresa_ejecutor": 40,
+    }
+    ANCHO_MIN = 12   # ninguna columna mas angosta que esto
+
+    def _autofit_sheet(ws):
+        """
+        Ajusta el ancho de cada columna de una hoja openpyxl al contenido real.
+        Recorre todas las celdas (incluyendo cabecera) y aplica ANCHO_MIN/MAX.
+        Activa wrap_text en celdas cuyo contenido supere el ancho maximo.
+        """
+        from openpyxl.utils import get_column_letter
+        from openpyxl.styles import Alignment
+
+        for col_idx, col_cells in enumerate(ws.iter_cols(), start=1):
+            col_letter  = get_column_letter(col_idx)
+            header_name = col_cells[0].value  # fila 1 = cabecera
+
+            # Ancho real: maximo de todos los valores de la columna
+            max_len = max(
+                (len(str(cell.value)) if cell.value is not None else 0)
+                for cell in col_cells
+            )
+
+            # Aplicar limites
+            maximo = ANCHO_MAX.get(str(header_name), 50)
+            ancho  = max(ANCHO_MIN, min(max_len + 2, maximo))
+            ws.column_dimensions[col_letter].width = ancho
+
+            # Wrap text en celdas de datos que superan el ancho maximo
+            if max_len > maximo:
+                for cell in col_cells[1:]:   # saltar cabecera
+                    cell.alignment = Alignment(wrap_text=True)
+
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer,           sheet_name="Detalle",   index=False)
-        df_mensual.to_excel(writer,   sheet_name="Mensual",   index=False)
-        df_evolutivo.to_excel(writer, sheet_name="Evolutivo")
+        df[cols_presentes].to_excel(writer, sheet_name="Detalle",   index=False)
+        df_mensual.to_excel(writer,         sheet_name="Mensual",   index=False)
+        df_evolutivo.to_excel(writer,       sheet_name="Evolutivo")
+
+        # Autoajuste dentro del bloque `with` — workbook todavia abierto
+        for sheet_name in writer.sheets:
+            _autofit_sheet(writer.sheets[sheet_name])
 
     output.seek(0)
     filename = f"Detalle_jira_{fecha_fin.replace('-', '')}.xlsx"
