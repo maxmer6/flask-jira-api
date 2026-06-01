@@ -121,7 +121,8 @@ def apply_cors(response):
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN JIRA
 # ─────────────────────────────────────────────
-JIRA_URL  = os.getenv("JIRA_URL")
+# DESPUÉS
+JIRA_URL  = os.getenv("JIRA_URL", "").rstrip("/")
 EMAIL     = os.getenv("JIRA_EMAIL")
 API_TOKEN = os.getenv("JIRA_TOKEN")
 
@@ -1408,36 +1409,32 @@ def download_excel():
 # ║           instancias dormidas (Render free tier, etc.).      ║
 # ╚═══════════════════════════════════════════════════════════════╝
 # ─────────────────────────────────────────────────────────────────
+
 @app.route("/health", methods=["GET"])
 def health():
-    """
-    Verifica disponibilidad de la API y conectividad con Jira.
-
-    Power Automate:
-        @body('HTTP')?['data']?['jira']  → "ok" | "error"
-        @body('HTTP')?['data']?['api']   → "ok"
-    """
     jira_ok = False
+    jira_detail = ""
     try:
         r = requests.get(
             f"{JIRA_URL}/rest/api/3/myself",
             auth=AUTH, headers=REQ_HEADERS, timeout=10,
         )
         jira_ok = (r.status_code == 200)
-    except Exception:
-        pass
+        jira_detail = str(r.status_code)
+    except Exception as exc:
+        jira_detail = str(exc)
 
     status_code = 200 if jira_ok else 503
     return _ok(
         data={
-            "api":  "ok",
-            "jira": "ok" if jira_ok else "error",
+            "api":         "ok",
+            "jira":        "ok" if jira_ok else "error",
+            "jira_detail": jira_detail,
         },
         message="API operativa" if jira_ok else "Jira no disponible",
         meta={"version": "2.0"},
         status=status_code,
     )
-
 
 # ─────────────────────────────────────────────────────────────────
 # HANDLERS PARA RUTAS AUTOMÁTICAS DEL NAVEGADOR
