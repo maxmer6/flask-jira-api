@@ -250,13 +250,19 @@ if PG_TABLE_EVOLUTIVO not in _PG_TABLE_ALLOWLIST:
         f"PG_TABLE_EVOLUTIVO '{PG_TABLE_EVOLUTIVO}' no está en la allowlist permitida: {_PG_TABLE_ALLOWLIST}"
     )
 
-# FIX 8: Engine SQLAlchemy promovido a singleton global.
-# Con pool_pre_ping=True SQLAlchemy verifica y restablece conexiones caídas automáticamente.
-# pool_size=3 y max_overflow=5 son valores conservadores adecuados para Render free tier.
-# Al ser global, el pool se comparte entre todas las requests y no se paga el costo
-# de TCP handshake en cada llamada (era el comportamiento anterior con crear_engine_db()).
-# FIX 15 (parcial): DB_URI reemplazado por SA_URL para que la contraseña no quede
-# como string plano en memoria (SA_URL la encapsula y no la expone en __repr__).
+# FIX 8 + COLD-START FIX: Engine SQLAlchemy como lazy singleton.
+#
+# PROBLEMA: create_engine() a nivel de modulo bloqueaba el arranque de Gunicorn
+# porque pool_pre_ping=True intentaba abrir una conexion TCP real a PostgreSQL
+# durante el import. Si la BD de Render tardaba > 30s (cold start), Gunicorn
+# mataba el worker con SIGKILL antes del primer request.
+#
+# SOLUCION: La URL se construye al importar (solo configura parametros, no conecta),
+# pero el engine se instancia la primera vez que _get_engine() es llamado desde
+# dentro de un request, ya con Gunicorn estable y el worker listo.
+#
+# FIX 15: SA_URL.create() encapsula la contrasena para que no quede como
+# string plano en memoria ni aparezca en tracebacks de SQLAlchemy.
 _DB_URL = SA_URL.create(
     drivername="postgresql",
     username=PG_CONFIG["user"],
@@ -265,13 +271,27 @@ _DB_URL = SA_URL.create(
     port=int(PG_CONFIG["port"]),
     database=PG_CONFIG["database"],
 )
-DB_ENGINE = create_engine(
-    _DB_URL,
-    pool_pre_ping=True,
-    pool_size=3,
-    max_overflow=5,
-    pool_recycle=1800,   # recicla conexiones inactivas cada 30 min
-)
+_DB_ENGINE = None   # se inicializa en la primera llamada a _get_engine()
+
+
+def _get_engine():
+    """
+    Devuelve el engine SQLAlchemy global, creandolo si aun no existe.
+    Patron lazy singleton: el engine y su pool se instancian la primera
+    vez que se llama este metodo, no al importar el modulo.
+    Evita que Gunicorn muera por timeout de BD durante el cold start.
+    """
+    global _DB_ENGINE
+    if _DB_ENGINE is None:
+        _DB_ENGINE = create_engine(
+            _DB_URL,
+            pool_pre_ping=True,   # reconexion automatica tras conexiones caidas
+            pool_size=3,
+            max_overflow=5,
+            pool_recycle=1800,    # recicla conexiones inactivas cada 30 min
+        )
+        print(f"[{datetime.now():%H:%M:%S}] DB engine creado (lazy init)")
+    return _DB_ENGINE
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -726,7 +746,7 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
         # valores, eliminando el loop fila a fila que causaba N round-trips a BD.
         # if_exists="append" porque la tabla ya existe; el DELETE previo asegura
         # que no haya duplicados para la misma fecha_fin.
-        with DB_ENGINE.begin() as conn:
+        with _get_engine().begin() as conn:
             # Primero: borrar registros existentes para esta fecha_fin
             conn.execute(
                 text(f"DELETE FROM {PG_SCHEMA}.{PG_TABLE_EVOLUTIVO} WHERE fecha_fin = :fd"),
@@ -783,7 +803,7 @@ def consultar_historico_evolutivo() -> pd.DataFrame:
         WHERE fecha_fin::DATE IN (SELECT fecha FROM ultimas_fechas)
         ORDER BY supervisor, fecha_fin
         """
-        df = pd.read_sql(query, DB_ENGINE)
+        df = pd.read_sql(query, _get_engine())
         if df.empty:
             return pd.DataFrame()
 
@@ -1543,7 +1563,7 @@ def health():
         pass
 
     try:
-        with DB_ENGINE.connect() as conn:
+        with _get_engine().connect() as conn:
             conn.execute(text("SELECT 1"))
         db_ok = True
     except Exception:
