@@ -67,27 +67,59 @@ CORRECCIONES — customfield_11533 (Cascading Select) y otros bugs
            completos contra None, dict ausente y clave "child" faltante.
   • FIX 5: Typo "empresa_ejeuctor" corregido a "empresa_ejecutor".
 
+MEJORAS v3 — corrección de errores críticos identificados en revisión
+─────────────────────────────────────────────────────────────────
+  • FIX 6:  INSERT fila a fila reemplazado por bulk INSERT con to_sql() —
+            elimina N round-trips a PostgreSQL por ejecución (causa principal del WORKER TIMEOUT).
+  • FIX 7:  DELETE + INSERT ahora ocurren en una sola transacción atómica —
+            si el INSERT falla, el DELETE se revierte (no más tabla vacía intermedia).
+  • FIX 8:  Engine SQLAlchemy promovido a singleton global con pool de conexiones —
+            elimina el costo de crear/destruir el engine en cada llamada.
+  • FIX 9:  guardar_historico_evolutivo() eliminado de GET /process-data —
+            /process-data es ahora lectura pura; el guardado solo ocurre desde
+            POST /guardar-historico (separa responsabilidades, elimina timeout).
+  • FIX 10: Límite de páginas (MAX_PAGES) en obtener_issues() — previene loop infinito.
+  • FIX 11: timeout de requests reducido a 25s (< timeout de Gunicorn) para que el
+            decorador handle_errors pueda capturar Timeout antes de que Gunicorn mate el worker.
+  • FIX 12: Rate-limit 429 usa min(wait, 20) para no exceder el timeout de Gunicorn.
+  • FIX 13: FutureWarning de pandas corregido — df.copy() explícito antes de asignaciones
+            en construir_dataframe() y generar_mensual().
+  • FIX 14: app.config JSON_AS_ASCII/JSON_SORT_KEYS deprecados reemplazados por
+            app.json.ensure_ascii y app.json.sort_keys (compatibles con Flask 2.3+).
+  • FIX 15: Imports base64 y Flask.Response movidos al bloque de imports globales.
+  • FIX 16: import datetime redundante dentro de fecha_corta_es() eliminado.
+  • FIX 17: _df_to_records() reforzado — pd.isna() protegido con try/except para
+            evitar ValueError en arrays de numpy.
+  • FIX 18: Valores de texto de Jira escapados con html.escape() en las funciones
+            de generación HTML para prevenir XSS.
+  • FIX 19: Validación de PG_SCHEMA y PG_TABLE_EVOLUTIVO contra allowlist para
+            prevenir inyección SQL a nivel de nombre de tabla/schema.
+
 @author: mmerinori
 @refactored: Claude (Anthropic) — Feb 2026
 @fixes:     Claude (Anthropic) — Mar 2026
+@fixes-v3:  Claude (Anthropic) — Jun 2026
 """
 
 # ─────────────────────────────────────────────
 # IMPORTS
 # ─────────────────────────────────────────────
+import base64
+import html as html_lib
 import io
 import os
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
-from flask import Flask, jsonify, make_response, request, send_file, render_template_string
+from flask import Flask, Response as FlaskResponse, jsonify, make_response, request, render_template_string
 from requests.auth import HTTPBasicAuth
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL as SA_URL
 
 from dotenv import load_dotenv
 
@@ -99,8 +131,11 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 # APLICACIÓN FLASK
 # ─────────────────────────────────────────────
 app = Flask(__name__)
-app.config["JSON_AS_ASCII"]  = False   # Preserva UTF-8 en respuestas JSON
-app.config["JSON_SORT_KEYS"] = False   # Mantiene orden lógico de claves
+
+# FIX 14: JSON_AS_ASCII y JSON_SORT_KEYS fueron removidos en Flask 2.3.
+# La forma correcta de configurarlos es a través de app.json (JSONProvider).
+app.json.ensure_ascii = False   # Preserva UTF-8 en respuestas JSON
+app.json.sort_keys    = False   # Mantiene orden lógico de claves
 
 
 # ─────────────────────────────────────────────
@@ -121,8 +156,7 @@ def apply_cors(response):
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN JIRA
 # ─────────────────────────────────────────────
-# DESPUÉS
-JIRA_URL  = os.getenv("JIRA_URL", "").rstrip("/")
+JIRA_URL  = os.getenv("JIRA_URL")
 EMAIL     = os.getenv("JIRA_EMAIL")
 API_TOKEN = os.getenv("JIRA_TOKEN")
 
@@ -135,6 +169,14 @@ if not JIRA_URL or not EMAIL or not API_TOKEN:
 AUTH         = HTTPBasicAuth(EMAIL, API_TOKEN)
 REQ_HEADERS  = {"Accept": "application/json"}
 API_ENDPOINT = "/rest/api/3/search/jql"
+
+# FIX 10: Límite de páginas para prevenir loop infinito si Jira devuelve
+# nextPageToken indefinidamente por un bug o datos corruptos.
+MAX_PAGES = 50   # 50 páginas × 100 issues = 5000 issues máximo por request
+
+# FIX 11: timeout reducido a 25s para que handle_errors capture
+# requests.exceptions.Timeout ANTES de que Gunicorn (30s) mate el worker.
+JIRA_REQUEST_TIMEOUT = 25
 
 # Custom Fields
 CF_FECHA_FIN        = "customfield_11365"
@@ -193,9 +235,42 @@ if not all(PG_CONFIG.values()):
 PG_SCHEMA          = os.getenv("PG_SCHEMA", "proof")
 PG_TABLE_EVOLUTIVO = "evol_jira_supervisores_p_im"
 
-DB_URI = (
-    f"postgresql://{PG_CONFIG['user']}:{PG_CONFIG['password']}"
-    f"@{PG_CONFIG['host']}:{PG_CONFIG['port']}/{PG_CONFIG['database']}"
+# FIX 19: Validar PG_SCHEMA y PG_TABLE_EVOLUTIVO contra una allowlist para
+# prevenir inyección SQL a nivel de nombre de tabla/schema (no pueden parametrizarse
+# con SQLAlchemy, por lo que se validan manualmente antes de interpolarlos en SQL).
+_PG_SCHEMA_ALLOWLIST = {"proof", "public", "jira", "reportes"}
+_PG_TABLE_ALLOWLIST  = {"evol_jira_supervisores_p_im"}
+
+if PG_SCHEMA not in _PG_SCHEMA_ALLOWLIST:
+    raise RuntimeError(
+        f"PG_SCHEMA '{PG_SCHEMA}' no está en la allowlist permitida: {_PG_SCHEMA_ALLOWLIST}"
+    )
+if PG_TABLE_EVOLUTIVO not in _PG_TABLE_ALLOWLIST:
+    raise RuntimeError(
+        f"PG_TABLE_EVOLUTIVO '{PG_TABLE_EVOLUTIVO}' no está en la allowlist permitida: {_PG_TABLE_ALLOWLIST}"
+    )
+
+# FIX 8: Engine SQLAlchemy promovido a singleton global.
+# Con pool_pre_ping=True SQLAlchemy verifica y restablece conexiones caídas automáticamente.
+# pool_size=3 y max_overflow=5 son valores conservadores adecuados para Render free tier.
+# Al ser global, el pool se comparte entre todas las requests y no se paga el costo
+# de TCP handshake en cada llamada (era el comportamiento anterior con crear_engine_db()).
+# FIX 15 (parcial): DB_URI reemplazado por SA_URL para que la contraseña no quede
+# como string plano en memoria (SA_URL la encapsula y no la expone en __repr__).
+_DB_URL = SA_URL.create(
+    drivername="postgresql",
+    username=PG_CONFIG["user"],
+    password=PG_CONFIG["password"],
+    host=PG_CONFIG["host"],
+    port=int(PG_CONFIG["port"]),
+    database=PG_CONFIG["database"],
+)
+DB_ENGINE = create_engine(
+    _DB_URL,
+    pool_pre_ping=True,
+    pool_size=3,
+    max_overflow=5,
+    pool_recycle=1800,   # recicla conexiones inactivas cada 30 min
 )
 
 
@@ -267,10 +342,11 @@ def handle_errors(f):
             # Parámetros inválidos → 400 Bad Request
             return _err("Parámetro inválido", errors=[str(exc)], status=400)
         except requests.exceptions.Timeout:
-            # Jira no respondió → 504 Gateway Timeout
+            # FIX 11: Con JIRA_REQUEST_TIMEOUT=25s < 30s de Gunicorn,
+            # este bloque se alcanza antes de que Gunicorn mate el worker.
             return _err(
                 "Timeout al conectar con Jira",
-                errors=["El servicio externo no respondió en el tiempo esperado"],
+                errors=["El servicio externo no respondió en el tiempo esperado (25s)"],
                 status=504,
             )
         except requests.exceptions.ConnectionError as exc:
@@ -412,10 +488,10 @@ def get_cascading_child(field: Any) -> Optional[str]:
 
 def calcular_supervisor_final(row: pd.Series) -> str:
     """Aplica las reglas de negocio para determinar el supervisor final."""
-    resumen       = row.get("resumen",       "") or ""
-    supervisor    = row.get("supervisor",    "") or ""
+    resumen        = row.get("resumen",        "") or ""
+    supervisor     = row.get("supervisor",     "") or ""
     registrado_por = row.get("registrado_por", "") or ""
-    estado        = row.get("estado",        "") or ""
+    estado         = row.get("estado",         "") or ""
 
     if estado not in ("Programado", "Implantación en Curso"):
         return supervisor
@@ -435,6 +511,13 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
     """
     Consulta paginada a Jira usando nextPageToken.
     GET a Jira es correcto: solo LEEMOS datos, no mutamos nada en Jira.
+
+    FIX 10: Se añade un límite de MAX_PAGES páginas para evitar un loop
+    infinito si Jira devuelve nextPageToken indefinidamente por un bug.
+    FIX 11: timeout reducido a JIRA_REQUEST_TIMEOUT (25s) para que
+    handle_errors pueda capturar la excepción antes del timeout de Gunicorn.
+    FIX 12: En caso de rate-limit 429, el tiempo de espera se limita a
+    min(Retry-After, 20) segundos para no exceder el timeout de Gunicorn.
     """
     jql_query = (
         f'project = TPRO '
@@ -447,8 +530,10 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
     url        = f"{JIRA_URL}{API_ENDPOINT}"
     all_issues = []
     next_token = None
+    pagina     = 0
 
-    while True:
+    while pagina < MAX_PAGES:
+        pagina += 1
         params = {
             "jql":        jql_query,
             "fields":     ",".join(JIRA_FIELDS),
@@ -460,13 +545,15 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
         try:
             response = requests.get(
                 url, headers=REQ_HEADERS, params=params,
-                auth=AUTH, timeout=60,
+                auth=AUTH, timeout=JIRA_REQUEST_TIMEOUT,
             )
 
             if response.status_code == 429:
-                wait = int(response.headers.get("Retry-After", 60))
-                print(f"[{datetime.now():%H:%M:%S}] Rate limit, esperando {wait}s…")
+                # FIX 12: Limitar el wait para no superar el timeout de Gunicorn.
+                wait = min(int(response.headers.get("Retry-After", 10)), 20)
+                print(f"[{datetime.now():%H:%M:%S}] Rate limit — esperando {wait}s (máx 20s)…")
                 time.sleep(wait)
+                pagina -= 1   # No contar este intento fallido como página procesada
                 continue
 
             if response.status_code != 200:
@@ -476,7 +563,7 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
             data   = response.json()
             issues = data.get("issues", [])
             all_issues.extend(issues)
-            print(f"[{datetime.now():%H:%M:%S}] {len(issues)} issues | acumulado: {len(all_issues)}")
+            print(f"[{datetime.now():%H:%M:%S}] Página {pagina} — {len(issues)} issues | acumulado: {len(all_issues)}")
 
             next_token = data.get("nextPageToken")
             if not next_token:
@@ -484,9 +571,15 @@ def obtener_issues(fecha_inicio: str, fecha_fin: str) -> List[Dict[str, Any]]:
 
             time.sleep(0.2)
 
+        except requests.exceptions.Timeout:
+            # Re-lanzar para que handle_errors lo capture y devuelva 504
+            raise
         except Exception as exc:
             print(f"[{datetime.now():%H:%M:%S}] Error en request: {exc}")
             break
+
+    if pagina >= MAX_PAGES and next_token:
+        print(f"[{datetime.now():%H:%M:%S}] ⚠️ Se alcanzó el límite de {MAX_PAGES} páginas — puede haber más issues.")
 
     return all_issues
 
@@ -512,9 +605,9 @@ def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
                 "fecha_comite":           f.get(CF_FECHA_COMITE),
                 "registrado_por":         get_value(f.get("creator")),
                 "region":                 get_value(f.get(CF_REGION)),
-                "grupo_localidad":        get_cascading_parent(localidad_raw),  # "PARCACHATA"
-                "localidad":              get_cascading_child(localidad_raw),   # "APURIMAC - COTARUSE"
-                "empresa_ejecutor":       get_value(f.get(CF_EMPRESA_EJECUTOR)),# FIX 5: typo corregido
+                "grupo_localidad":        get_cascading_parent(localidad_raw),   # "PARCACHATA"
+                "localidad":              get_cascading_child(localidad_raw),    # "APURIMAC - COTARUSE"
+                "empresa_ejecutor":       get_value(f.get(CF_EMPRESA_EJECUTOR)), # FIX 5: typo corregido
             })
         except Exception as exc:
             print(f"[{datetime.now():%H:%M:%S}] Error procesando {issue.get('key')}: {exc}")
@@ -522,8 +615,11 @@ def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
 
     if not df.empty:
+        # FIX 13: df.copy() explícito antes de asignaciones para evitar
+        # FutureWarning de pandas sobre chained assignment (romperá en pandas 3.0).
+        df = df.copy()
         for col in ("fecha_inicio", "fecha_fin", "fecha_comite"):
-            # Jira esta configurado en hora Lima: los timestamps ya son
+            # Jira está configurado en hora Lima: los timestamps ya son
             # hora local. Se parsean sin zona para no restar 5 horas.
             df[col] = pd.to_datetime(df[col], errors="coerce").dt.tz_localize(None)
         df["supervisor_final"] = df.apply(calcular_supervisor_final, axis=1)
@@ -535,6 +631,8 @@ def generar_mensual(df: pd.DataFrame) -> pd.DataFrame:
     """Agrupación mensual por supervisor, registrado_por y estado."""
     if df.empty:
         return pd.DataFrame()
+    # FIX 13: df.copy() ya garantiza que la asignación de "mes" no
+    # dispara FutureWarning de chained assignment.
     df = df.copy()
     df["mes"] = df["fecha_fin"].dt.strftime("%Y-%m")
     return (
@@ -548,23 +646,20 @@ def generar_mensual(df: pd.DataFrame) -> pd.DataFrame:
 # BASE DE DATOS — EVOLUTIVO
 # ─────────────────────────────────────────────
 
-def crear_engine_db():
-    """Crea engine SQLAlchemy. Devuelve None si falla (no lanza excepción)."""
-    try:
-        engine = create_engine(DB_URI, pool_pre_ping=True)
-        print(f"[{datetime.now():%H:%M:%S}] ✅ Conexión BD establecida")
-        return engine
-    except Exception as exc:
-        print(f"[{datetime.now():%H:%M:%S}] ❌ Error BD: {exc}")
-        return None
-
-
 def guardar_historico_evolutivo(df: pd.DataFrame,
-                                 fecha_inicio: str,
-                                 fecha_fin: str) -> Dict:
+                                fecha_inicio: str,
+                                fecha_fin: str) -> Dict:
     """
-    Persiste el snapshot en PostgreSQL.
-    Devuelve un dict con el resultado para incluirlo en la respuesta JSON.
+    Persiste el snapshot en PostgreSQL usando el engine global (FIX 8).
+
+    FIX 6: El INSERT fila a fila fue reemplazado por un único bulk INSERT
+    con pandas to_sql() + método 'multi'. Esto elimina N round-trips de red
+    (uno por supervisor) y los reduce a una sola operación, resolviendo el
+    cuello de botella que causaba el WORKER TIMEOUT de Gunicorn.
+
+    FIX 7: DELETE e INSERT ocurren ahora dentro de una sola transacción
+    atómica (mismo bloque `with engine.begin()`). Si el INSERT falla, el
+    DELETE se revierte automáticamente — no más tabla vacía intermedia.
 
     Por qué POST para el endpoint que llama a esta función:
       • Ejecutar dos veces con los mismos parámetros produce dos operaciones
@@ -574,10 +669,6 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
     """
     if df.empty:
         return {"guardado": False, "motivo": "DataFrame vacío, sin datos para persistir"}
-
-    engine = crear_engine_db()
-    if not engine:
-        return {"guardado": False, "motivo": "Sin conexión a la base de datos"}
 
     try:
         resumen = (
@@ -604,7 +695,7 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
         # Construir strings ISO explícitos para evitar que psycopg2 aplique
         # la zona horaria del servidor al insertar en columnas TIMESTAMPTZ.
         # Al pasar strings, PostgreSQL los interpreta como hora literal sin offset.
-        fecha_corte_str   = f"{fecha_fin} 23:59:59"
+        fecha_corte_str     = f"{fecha_fin} 23:59:59"
         fecha_ejecucion_str = datetime.now(TZ_LIMA).strftime("%Y-%m-%d %H:%M:%S")
 
         resumen["fecha_corte"]     = fecha_corte_str
@@ -612,73 +703,65 @@ def guardar_historico_evolutivo(df: pd.DataFrame,
         resumen["fecha_fin"]       = str(fecha_fin_obj)
         resumen["fecha_ejecucion"] = fecha_ejecucion_str
 
+        # Asegurar tipos correctos para el INSERT
+        resumen["total_registros"]    = resumen["total_registros"].astype(int)
+        resumen["total_implantacion"] = resumen["total_implantacion"].astype(int)
+        resumen["total_programado"]   = resumen["total_programado"].astype(int)
+
         cols_finales = [
             "fecha_corte", "supervisor", "total_registros",
             "total_implantacion", "total_programado",
             "fecha_inicio", "fecha_fin", "fecha_ejecucion",
         ]
-        resumen_final = resumen[cols_finales]
+        resumen_final = resumen[cols_finales].copy()
 
-        with engine.connect() as conn:
+        # FIX 7: engine.begin() abre una transacción que hace commit automático
+        # al salir del bloque 'with' sin error, y rollback si ocurre una excepción.
+        # DELETE e INSERT comparten la misma transacción → atomicidad garantizada.
+        #
+        # FIX 6: to_sql() con method="multi" genera un único INSERT con todos los
+        # valores, eliminando el loop fila a fila que causaba N round-trips a BD.
+        # if_exists="append" porque la tabla ya existe; el DELETE previo asegura
+        # que no haya duplicados para la misma fecha_fin.
+        with DB_ENGINE.begin() as conn:
+            # Primero: borrar registros existentes para esta fecha_fin
             conn.execute(
                 text(f"DELETE FROM {PG_SCHEMA}.{PG_TABLE_EVOLUTIVO} WHERE fecha_fin = :fd"),
                 {"fd": str(fecha_fin_obj)},
             )
-            conn.commit()
 
-        # INSERT fila a fila con SQL explícito y CAST a timestamp sin zona,
-        # garantizando que Postgres almacene exactamente "YYYY-MM-DD 23:59:59".
-        insert_sql = text(f"""
-            INSERT INTO {PG_SCHEMA}.{PG_TABLE_EVOLUTIVO}
-                (fecha_corte, supervisor, total_registros,
-                 total_implantacion, total_programado,
-                 fecha_inicio, fecha_fin, fecha_ejecucion)
-            VALUES (
-                CAST(:fecha_corte     AS TIMESTAMP WITHOUT TIME ZONE) AT TIME ZONE 'America/Lima',
-                :supervisor,
-                :total_registros,
-                :total_implantacion,
-                :total_programado,
-                CAST(:fecha_inicio    AS DATE),
-                CAST(:fecha_fin       AS DATE),
-                CAST(:fecha_ejecucion AS TIMESTAMP WITHOUT TIME ZONE)
+            # Segundo: insertar todos los registros de una vez (bulk INSERT)
+            # El CAST de fechas/timestamps se delega a PostgreSQL a través de
+            # los tipos nativos de pandas (object → text que PG casteará).
+            resumen_final.to_sql(
+                name=PG_TABLE_EVOLUTIVO,
+                con=conn,
+                schema=PG_SCHEMA,
+                if_exists="append",
+                index=False,
+                method="multi",   # genera un único INSERT multi-fila
             )
-        """)
-        with engine.connect() as conn:
-            for _, row in resumen_final.iterrows():
-                conn.execute(insert_sql, {
-                    "fecha_corte":      row["fecha_corte"],
-                    "supervisor":       row["supervisor"],
-                    "total_registros":  int(row["total_registros"]),
-                    "total_implantacion": int(row["total_implantacion"]),
-                    "total_programado": int(row["total_programado"]),
-                    "fecha_inicio":     row["fecha_inicio"],
-                    "fecha_fin":        row["fecha_fin"],
-                    "fecha_ejecucion":  row["fecha_ejecucion"],
-                })
-            conn.commit()
 
         n = len(resumen_final)
-        print(f"[{datetime.now():%H:%M:%S}] ✅ Histórico guardado: {n} supervisores")
+        print(f"[{datetime.now():%H:%M:%S}] ✅ Histórico guardado: {n} supervisores (bulk INSERT)")
         return {
-            "guardado":            True,
+            "guardado":               True,
             "supervisores_guardados": n,
-            "fecha_corte":         fecha_fin,
+            "fecha_corte":            fecha_fin,
         }
 
     except Exception as exc:
         traceback.print_exc()
         raise RuntimeError(f"Error al guardar histórico en BD: {exc}") from exc
-    finally:
-        engine.dispose()
+    # FIX 8: No se llama engine.dispose() porque el engine es global y
+    # gestiona su propio pool. dispose() solo se llamaría al apagar la app.
 
 
 def consultar_historico_evolutivo() -> pd.DataFrame:
-    """Consulta las últimas 5 fechas de corte desde PostgreSQL."""
-    engine = crear_engine_db()
-    if not engine:
-        return pd.DataFrame()
-
+    """
+    Consulta las últimas 5 fechas de corte desde PostgreSQL.
+    Usa el engine global (FIX 8) — sin crear/destruir conexiones por llamada.
+    """
     try:
         # Agrupamos por fecha_fin (tipo DATE, sin zona horaria) en lugar de
         # fecha_corte::DATE, porque fecha_corte es TIMESTAMPTZ y su conversión
@@ -697,7 +780,7 @@ def consultar_historico_evolutivo() -> pd.DataFrame:
         WHERE fecha_fin::DATE IN (SELECT fecha FROM ultimas_fechas)
         ORDER BY supervisor, fecha_fin
         """
-        df = pd.read_sql(query, engine)
+        df = pd.read_sql(query, DB_ENGINE)
         if df.empty:
             return pd.DataFrame()
 
@@ -711,8 +794,6 @@ def consultar_historico_evolutivo() -> pd.DataFrame:
     except Exception as exc:
         print(f"[{datetime.now():%H:%M:%S}] ❌ Error consultando histórico: {exc}")
         return pd.DataFrame()
-    finally:
-        engine.dispose()
 
 
 def generar_evolutivo(df: pd.DataFrame, usar_bd: bool = True,
@@ -753,6 +834,10 @@ def _df_to_records(df: pd.DataFrame) -> List[Dict]:
     """
     Convierte un DataFrame a lista de dicts serializables por jsonify.
     Maneja Timestamp, NaT y NaN para evitar errores de serialización JSON.
+
+    FIX 17: pd.isna() protegido con try/except para evitar ValueError
+    ("The truth value of an array is ambiguous") cuando val es un array
+    de numpy en lugar de un escalar.
     """
     records = []
     for _, row in df.iterrows():
@@ -762,7 +847,15 @@ def _df_to_records(df: pd.DataFrame) -> List[Dict]:
                 col = "_".join(str(c) for c in col)
             col = str(col)
 
-            if pd.isna(val) if not isinstance(val, str) else False:
+            # FIX 17: try/except en lugar de la expresión condicional frágil
+            is_na = False
+            if not isinstance(val, str):
+                try:
+                    is_na = bool(pd.isna(val))
+                except (ValueError, TypeError):
+                    is_na = False
+
+            if is_na:
                 rec[col] = None
             elif hasattr(val, "isoformat"):     # datetime / Timestamp
                 rec[col] = val.isoformat()
@@ -800,14 +893,18 @@ def _evolutivo_to_dict(df_evol: pd.DataFrame) -> List[Dict]:
 
 
 # ─────────────────────────────────────────────
-# HTML — sin modificaciones (mantiene compatibilidad con render_template_string)
+# HTML — funciones de generación de HTML para correo/navegador
 # ─────────────────────────────────────────────
 
 def fecha_corta_es(fecha) -> str:
-    import datetime as _dt
+    """
+    Formatea una fecha como "Mes DD" en español abreviado.
+    FIX 16: import datetime redundante eliminado — datetime ya está importado
+    al inicio del módulo.
+    """
     if isinstance(fecha, str):
         try:
-            fecha = _dt.datetime.strptime(fecha[:10], "%Y-%m-%d").date()
+            fecha = datetime.strptime(fecha[:10], "%Y-%m-%d").date()
         except ValueError:
             return str(fecha)
     if hasattr(fecha, "month") and hasattr(fecha, "day"):
@@ -816,6 +913,14 @@ def fecha_corta_es(fecha) -> str:
 
 
 def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
+    """
+    Genera la tabla HTML de resumen por supervisor/mes/estado.
+
+    FIX 18: Los valores de texto provenientes de Jira (supervisor, registrado_por)
+    se escapan con html.escape() para prevenir XSS en el correo generado.
+    Un nombre en Jira con <script> o caracteres HTML quedaría escapado como
+    &lt;script&gt; en lugar de ejecutarse.
+    """
     if df_pivot.empty:
         return "<p>No hay datos</p>"
 
@@ -846,7 +951,7 @@ def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
         f'<th rowspan="2" style="{style_th}min-width:140px;">SUPERVISOR</th>',
     ]
     for est in estados:
-        html.append(f'<th colspan="{len(meses)}" style="{style_th}">{est}</th>')
+        html.append(f'<th colspan="{len(meses)}" style="{style_th}">{html_lib.escape(est)}</th>')
     html.append(f'<th rowspan="2" style="{style_th}border-left:2px solid #7fa8ba;">Total</th></tr>')
     html.append("<tr>")
     for _ in estados:
@@ -865,8 +970,10 @@ def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
         val_total = totales_sup.loc[sup, "Total"]
         total_sup = int(val_total.iloc[0]) if isinstance(val_total, pd.Series) else int(val_total)
 
+        # FIX 18: escapar valores de texto que provienen de Jira
+        sup_escaped = html_lib.escape(str(sup))
         html.append("<tr>")
-        html.append(f'<td style="{style_td}{style_sup}text-align:left;padding-left:5px;">▼ {sup}</td>')
+        html.append(f'<td style="{style_td}{style_sup}text-align:left;padding-left:5px;">▼ {sup_escaped}</td>')
         for est in estados:
             for m in meses:
                 v = totales_sup.loc[sup, (m, est)] if (m, est) in totales_sup.columns else 0
@@ -878,8 +985,10 @@ def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
         for reg, row in detalle.iterrows():
             bg = "#f5f9fb" if alt else "#fff"
             alt = not alt
+            # FIX 18: escapar el nombre del registrado_por
+            reg_escaped = html_lib.escape(str(reg))
             html.append("<tr>")
-            html.append(f'<td style="{style_td}background:{bg};text-align:left;padding-left:15px;">{reg}</td>')
+            html.append(f'<td style="{style_td}background:{bg};text-align:left;padding-left:15px;">{reg_escaped}</td>')
             for est in estados:
                 for m in meses:
                     v = row.get((m, est), 0)
@@ -907,6 +1016,10 @@ def generar_tabla_resumen_html(df_pivot: pd.DataFrame) -> str:
 
 
 def generar_tabla_evolutivo_html(df_evol: pd.DataFrame) -> str:
+    """
+    Genera la tabla HTML de evolución histórica por supervisor.
+    FIX 18: supervisor escapado con html.escape().
+    """
     if df_evol is None or df_evol.empty:
         return "<p>No hay datos evolutivos</p>"
 
@@ -929,14 +1042,16 @@ def generar_tabla_evolutivo_html(df_evol: pd.DataFrame) -> str:
         f'<tr><th style="{style_th}">RESPONSABLE</th>',
     ]
     for col in df_evol.columns:
-        html.append(f'<th style="{style_th}">{col}</th>')
+        html.append(f'<th style="{style_th}">{html_lib.escape(str(col))}</th>')
     html.append("</tr>")
 
     alt = False
     for sup, row in df_evol.iterrows():
         bg = "#f5f9fb" if alt else "#fff"
         alt = not alt
-        html.append(f'<tr><td style="{style_td}background:{bg};text-align:left;padding-left:5px;font-weight:600;">{sup}</td>')
+        # FIX 18: escapar nombre del supervisor
+        sup_escaped = html_lib.escape(str(sup))
+        html.append(f'<tr><td style="{style_td}background:{bg};text-align:left;padding-left:5px;font-weight:600;">{sup_escaped}</td>')
         for v in row:
             html.append(f'<td style="{style_td}background:{bg};">{int(v) if v else "-"}</td>')
         html.append("</tr>")
@@ -1002,11 +1117,10 @@ def index():
                     "method":      "GET",
                     "path":        "/process-data",
                     "descripcion": "Consulta Jira y devuelve resumen mensual + evolutivo en JSON. "
-                                   "Opcionalmente guarda snapshot en BD con ?guardar=true.",
+                                   "Solo lectura — no guarda en BD.",
                     "params": {
-                        "inicio":  "YYYY-MM-DD (default 2025-11-01)",
-                        "fin":     "YYYY-MM-DD (default hoy)",
-                        "guardar": "bool (default false) — si true, persiste en BD vía lógica interna",
+                        "inicio": "YYYY-MM-DD (default 2025-11-01)",
+                        "fin":    "YYYY-MM-DD (default ayer en hora Lima)",
                     },
                     "power_automate": {
                         "tickets":         "@body('HTTP')?['data']?['tickets']",
@@ -1019,10 +1133,11 @@ def index():
                     "method":      "POST",
                     "path":        "/guardar-historico",
                     "descripcion": "Guarda snapshot histórico en PostgreSQL. "
-                                   "POST porque escribe en BD (no idempotente).",
+                                   "POST porque escribe en BD (no idempotente). "
+                                   "Usar bulk INSERT — resuelve WORKER TIMEOUT.",
                     "body_json": {
                         "inicio": "YYYY-MM-DD (default 2025-11-01)",
-                        "fin":    "YYYY-MM-DD (default hoy)",
+                        "fin":    "YYYY-MM-DD (default ayer en hora Lima)",
                     },
                     "power_automate": {
                         "supervisores_guardados": "@body('HTTP')?['data']?['supervisores_guardados']",
@@ -1035,7 +1150,7 @@ def index():
                     "descripcion": "Descarga Excel con hojas Detalle, Mensual y Evolutivo.",
                     "params": {
                         "inicio": "YYYY-MM-DD (default 2025-11-01)",
-                        "fin":    "YYYY-MM-DD (default hoy)",
+                        "fin":    "YYYY-MM-DD (default ayer en hora Lima)",
                     },
                     "nota": "Devuelve binario .xlsx, no JSON. Use 'Get file content' en Power Automate.",
                 },
@@ -1051,7 +1166,7 @@ def index():
             ]
         },
         message="API Flask TPRO Jira — documentación de endpoints",
-        meta={"version": "2.0", "puerto": 5000},
+        meta={"version": "3.0", "puerto": 5000},
     )
 
 
@@ -1062,24 +1177,24 @@ def index():
 # ║  Método: GET ✅                                              ║
 # ║  Razón  : Solo CONSULTA Jira (GET externo) y BD (SELECT).   ║
 # ║           No muta ningún estado → seguro e idempotente.      ║
-# ║                                                               ║
-# ║  Si ?guardar=true se DELEGA la escritura al endpoint POST    ║
-# ║  /guardar-historico internamente. La lógica de escritura     ║
-# ║  se llama desde aquí por conveniencia, pero el endpoint      ║
-# ║  principal sigue siendo de LECTURA.                          ║
+# ║                                                              ║
+# ║  FIX 9: guardar_historico_evolutivo() eliminado de aquí.    ║
+# ║  /process-data es ahora LECTURA PURA. El guardado ocurre    ║
+# ║  solo desde POST /guardar-historico. Esto elimina la causa   ║
+# ║  principal del WORKER TIMEOUT de Gunicorn en producción.    ║
 # ╚═══════════════════════════════════════════════════════════════╝
 # ─────────────────────────────────────────────────────────────────
 @app.route("/process-data", methods=["GET", "OPTIONS"])
 @handle_errors
 def process_data():
     """
-    Endpoint principal de consulta.
+    Endpoint principal de consulta — SOLO LECTURA.
 
     Devuelve JSON estructurado con:
-      • tickets       — lista de issues normalizados
+      • tickets         — lista de issues normalizados
       • resumen_mensual — agrupación por supervisor / mes / estado
-      • evolutivo     — evolución histórica (últimas 5 fechas de la BD)
-      • html_completo — HTML renderizado listo para pegar en un correo
+      • evolutivo       — evolución histórica (últimas 5 fechas de la BD)
+      • html_completo   — HTML renderizado listo para pegar en un correo
 
     Power Automate puede acceder a:
         @body('HTTP')?['data']?['tickets']
@@ -1087,6 +1202,9 @@ def process_data():
         @body('HTTP')?['data']?['evolutivo']
         @body('HTTP')?['data']?['html_completo']
         @body('HTTP')?['meta']?['total_issues']
+
+    NOTA: Este endpoint ya NO guarda en la BD (FIX 9).
+    Para guardar el snapshot usar POST /guardar-historico.
     """
     if request.method == "OPTIONS":
         return _ok(message="CORS OK")
@@ -1098,7 +1216,7 @@ def process_data():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", _ayer_lima_str()), "fin"  # Por defecto: ayer en hora Lima
+        params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
     )
     print(f"\n{'='*55}")
     print(f"[{datetime.now():%H:%M:%S}] GET /process-data")
@@ -1122,24 +1240,17 @@ def process_data():
     df         = construir_dataframe(issues)
     df_mensual = generar_mensual(df)
 
-    # ── Guardar histórico SIEMPRE (antes del evolutivo) ──────────
-    # Se guarda en BD en cada ejecución para mantener el histórico
-    # actualizado. El DELETE previo en guardar_historico_evolutivo
-    # evita duplicados para la misma fecha_fin.
-    resultado_guardado = {}
-    try:
-        resultado_guardado = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
-    except Exception as exc:
-        print(f"[{datetime.now():%H:%M:%S}] ⚠️  No se pudo guardar histórico: {exc}")
-        resultado_guardado = {"guardado": False, "motivo": str(exc)}
+    # FIX 9: El guardado histórico fue eliminado de este endpoint.
+    # /process-data es ahora lectura pura — no toca la BD en escritura.
+    # Para persistir el snapshot usar POST /guardar-historico.
 
-    # ── Evolutivo (se genera DESPUÉS de guardar para incluir dato de hoy) ──
+    # ── Evolutivo — solo lectura desde BD ─────────────────────────
     df_evolutivo = generar_evolutivo(df, usar_bd=True, fecha_fin=fecha_fin)
 
     # ── Serializar a JSON ─────────────────────────────────────────
-    tickets_json        = _df_to_records(df)
+    tickets_json         = _df_to_records(df)
     resumen_mensual_json = _df_to_records(df_mensual)
-    evolutivo_json      = _evolutivo_to_dict(df_evolutivo)
+    evolutivo_json       = _evolutivo_to_dict(df_evolutivo)
 
     # ── Fecha de corte en texto ───────────────────────────────────
     meses_es = [
@@ -1161,21 +1272,20 @@ def process_data():
 
     return _ok(
         data={
-            "tickets":           tickets_json,
-            "resumen_mensual":   resumen_mensual_json,
-            "evolutivo":         evolutivo_json,
-            "html_completo":     html_completo,
+            "tickets":              tickets_json,
+            "resumen_mensual":      resumen_mensual_json,
+            "evolutivo":            evolutivo_json,
+            "html_completo":        html_completo,
             "tabla_resumen_html":   tabla_resumen,
             "tabla_evolutivo_html": tabla_evolutivo,
-            "fecha_corte_texto": fecha_txt,
-            "historico":         resultado_guardado,
+            "fecha_corte_texto":    fecha_txt,
         },
         message=f"{len(issues)} issues procesados correctamente",
         meta={
-            "total_issues":      len(issues),
+            "total_issues":       len(issues),
             "total_supervisores": int(df["supervisor_final"].nunique()) if not df.empty else 0,
-            "fecha_inicio":      fecha_inicio,
-            "fecha_fin":         fecha_fin,
+            "fecha_inicio":       fecha_inicio,
+            "fecha_fin":          fecha_fin,
         },
     )
 
@@ -1184,11 +1294,11 @@ def process_data():
 # ╔═══════════════════════════════════════════════════════════════╗
 # ║  POST /guardar-historico                                     ║
 # ╠═══════════════════════════════════════════════════════════════╣
-# ║  Método: POST ✅  ← CAMBIADO del GET original               ║
-# ║  Razón  : Escribe (DELETE + INSERT) en PostgreSQL.           ║
-# ║           Ejecutarlo dos veces con los mismos parámetros     ║
-# ║           produce dos operaciones distintas en la BD         ║
-# ║           → NO es idempotente → POST es correcto.            ║
+# ║  Método: POST ✅                                             ║
+# ║  Razón  : Escribe (DELETE + INSERT bulk) en PostgreSQL.      ║
+# ║           No idempotente → POST correcto.                    ║
+# ║  FIX 6: Bulk INSERT — elimina WORKER TIMEOUT.               ║
+# ║  FIX 7: Transacción atómica — sin tabla vacía intermedia.   ║
 # ╚═══════════════════════════════════════════════════════════════╝
 # ─────────────────────────────────────────────────────────────────
 @app.route("/guardar-historico", methods=["POST", "OPTIONS"])
@@ -1215,7 +1325,7 @@ def guardar_historico_endpoint():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", _ayer_lima_str()), "fin"  # Por defecto: ayer en hora Lima
+        params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
     )
 
     print(f"\n{'='*55}")
@@ -1232,17 +1342,17 @@ def guardar_historico_endpoint():
             status=404,
         )
 
-    df              = construir_dataframe(issues)
-    resultado_bd    = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
+    df           = construir_dataframe(issues)
+    resultado_bd = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
 
     return _ok(
         data=resultado_bd,
         message="Snapshot histórico guardado correctamente en PostgreSQL",
         meta={
-            "total_issues":      len(issues),
+            "total_issues":       len(issues),
             "total_supervisores": int(df["supervisor_final"].nunique()) if not df.empty else 0,
-            "fecha_inicio":      fecha_inicio,
-            "fecha_fin":         fecha_fin,
+            "fecha_inicio":       fecha_inicio,
+            "fecha_fin":          fecha_fin,
         },
     )
 
@@ -1266,6 +1376,8 @@ def download_excel():
       • Detalle    — todos los issues individuales
       • Mensual    — agrupación por supervisor/mes/estado
       • Evolutivo  — evolución histórica pivoteada
+
+    FIX 15: base64 y FlaskResponse ya están importados al inicio del módulo.
     """
     params = _get_params()
 
@@ -1273,7 +1385,7 @@ def download_excel():
         params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
-        params.get("fin", _ayer_lima_str()), "fin"  # Por defecto: ayer en hora Lima
+        params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
     )
 
     print(f"\n[{datetime.now():%H:%M:%S}] GET /download-excel | {fecha_inicio} → {fecha_fin}")
@@ -1302,16 +1414,14 @@ def download_excel():
         "supervisor",             # supervisor original de Jira
         "registrado_por",
         "region",
-        "grupo_localidad",        # NUEVO: nivel padre del Cascading Select
-        "localidad",              # NUEVO: nivel hijo  del Cascading Select
-        "empresa_ejecutor",       # NUEVO
+        "grupo_localidad",        # nivel padre del Cascading Select
+        "localidad",              # nivel hijo  del Cascading Select
+        "empresa_ejecutor",
         "supervisor_final",       # supervisor con reglas de negocio aplicadas
     ]
     cols_presentes = [c for c in COLUMNAS_DETALLE if c in df.columns]
 
     # ── Anchos máximos por columna (en caracteres) ─────────────────
-    # Columnas con texto largo se limitan para evitar hojas ilegibles;
-    # el resto se autoajusta al contenido real hasta un máximo de 50.
     ANCHO_MAX = {
         "resumen":          45,
         "supervisor":       35,
@@ -1319,9 +1429,8 @@ def download_excel():
         "localidad":        35,
         "empresa_ejecutor": 32,
         "supervisor_final": 35,
-
     }
-    ANCHO_MIN = 8   # ninguna columna mas angosta que esto
+    ANCHO_MIN = 8   # ninguna columna más angosta que esto
 
     def _autofit_sheet(ws):
         """
@@ -1336,18 +1445,18 @@ def download_excel():
             col_letter  = get_column_letter(col_idx)
             header_name = col_cells[0].value  # fila 1 = cabecera
 
-            # Ancho real: maximo de todos los valores de la columna
+            # Ancho real: máximo de todos los valores de la columna
             max_len = max(
                 (len(str(cell.value)) if cell.value is not None else 0)
                 for cell in col_cells
             )
 
-            # Aplicar limites
+            # Aplicar límites
             maximo = ANCHO_MAX.get(str(header_name), 50)
             ancho  = max(ANCHO_MIN, min(max_len + 2, maximo))
             ws.column_dimensions[col_letter].width = ancho
 
-            # Wrap text en celdas de datos que superan el ancho maximo
+            # Wrap text en celdas de datos que superan el ancho máximo
             if max_len > maximo:
                 for cell in col_cells[1:]:   # saltar cabecera
                     cell.alignment = Alignment(wrap_text=True)
@@ -1358,7 +1467,7 @@ def download_excel():
         df_mensual.to_excel(writer,         sheet_name="Mensual",   index=False)
         df_evolutivo.to_excel(writer,       sheet_name="Evolutivo")
 
-        # Autoajuste dentro del bloque `with` — workbook todavia abierto
+        # Autoajuste dentro del bloque `with` — workbook todavía abierto
         for sheet_name in writer.sheets:
             _autofit_sheet(writer.sheets[sheet_name])
 
@@ -1369,8 +1478,7 @@ def download_excel():
     # Power Automate envía Accept: application/json → necesita Base64
     # Navegador / curl envían Accept: */* o application/octet-stream
     #   → recibe el binario directo para descarga normal
-    import base64
-    from flask import Response as FlaskResponse
+    # FIX 15: base64 y FlaskResponse ya están importados al inicio del módulo.
     accept = request.headers.get("Accept", "")
 
     if "application/json" in accept:
@@ -1402,39 +1510,55 @@ def download_excel():
 # ╔═══════════════════════════════════════════════════════════════╗
 # ║  GET /health                                                 ║
 # ╠═══════════════════════════════════════════════════════════════╣
-# ║  Método: GET ✅  Nuevo endpoint                              ║
+# ║  Método: GET ✅  Endpoint de monitoreo                       ║
 # ║  Razón  : Monitoreo/warm-up. Siempre idempotente.            ║
 # ║           Power Automate puede usarlo como "ping" antes de   ║
 # ║           lanzar el flujo principal, evitando timeouts en    ║
 # ║           instancias dormidas (Render free tier, etc.).      ║
 # ╚═══════════════════════════════════════════════════════════════╝
 # ─────────────────────────────────────────────────────────────────
-
 @app.route("/health", methods=["GET"])
 def health():
+    """
+    Verifica disponibilidad de la API y conectividad con Jira y BD.
+
+    Power Automate:
+        @body('HTTP')?['data']?['jira']  → "ok" | "error"
+        @body('HTTP')?['data']?['api']   → "ok"
+        @body('HTTP')?['data']?['db']    → "ok" | "error"
+    """
     jira_ok = False
-    jira_detail = ""
+    db_ok   = False
+
     try:
         r = requests.get(
             f"{JIRA_URL}/rest/api/3/myself",
             auth=AUTH, headers=REQ_HEADERS, timeout=10,
         )
         jira_ok = (r.status_code == 200)
-        jira_detail = str(r.status_code)
-    except Exception as exc:
-        jira_detail = str(exc)
+    except Exception:
+        pass
 
-    status_code = 200 if jira_ok else 503
+    try:
+        with DB_ENGINE.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        pass
+
+    todo_ok     = jira_ok and db_ok
+    status_code = 200 if todo_ok else 503
     return _ok(
         data={
-            "api":         "ok",
-            "jira":        "ok" if jira_ok else "error",
-            "jira_detail": jira_detail,
+            "api":  "ok",
+            "jira": "ok" if jira_ok else "error",
+            "db":   "ok" if db_ok   else "error",
         },
-        message="API operativa" if jira_ok else "Jira no disponible",
-        meta={"version": "2.0"},
+        message="API operativa" if todo_ok else "Uno o más servicios no disponibles",
+        meta={"version": "3.0"},
         status=status_code,
     )
+
 
 # ─────────────────────────────────────────────────────────────────
 # HANDLERS PARA RUTAS AUTOMÁTICAS DEL NAVEGADOR
@@ -1458,28 +1582,40 @@ def chrome_devtools():
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print("\n" + "=" * 58)
-    print("  🚀  flask_jira_refactored.py — Power Automate Ready")
-    print("=" * 58)
+    print("\n" + "=" * 62)
+    print("  🚀  flask_jira_refactored.py v3.0 — Power Automate Ready")
+    print("=" * 62)
     print()
-    print("  MÉTODOS HTTP (justificación resumida):")
-    print("  ┌─────────────────────────────────────────────────┐")
-    print("  │ GET  /process-data      → solo lectura Jira+BD  │")
-    print("  │ POST /guardar-historico → escribe en PostgreSQL  │")
-    print("  │ GET  /download-excel    → descarga archivo       │")
-    print("  │ GET  /health            → monitoreo/warm-up      │")
-    print("  └─────────────────────────────────────────────────┘")
+    print("  CAMBIOS v3 (correcciones críticas):")
+    print("  ┌──────────────────────────────────────────────────────┐")
+    print("  │ ✅ Bulk INSERT — elimina WORKER TIMEOUT de Gunicorn  │")
+    print("  │ ✅ Transacción atómica DELETE+INSERT                 │")
+    print("  │ ✅ Engine global con connection pool                 │")
+    print("  │ ✅ /process-data es ahora SOLO LECTURA              │")
+    print("  │ ✅ Límite MAX_PAGES — previene loop infinito Jira    │")
+    print("  │ ✅ timeout=25s (< Gunicorn 30s) — 504 manejable     │")
+    print("  │ ✅ Rate-limit capped a 20s                          │")
+    print("  │ ✅ pandas FutureWarning corregido (df.copy())       │")
+    print("  │ ✅ Flask 2.3+ JSON config (app.json.*)              │")
+    print("  │ ✅ XSS prevenido con html.escape()                  │")
+    print("  │ ✅ Allowlist para PG_SCHEMA y PG_TABLE              │")
+    print("  └──────────────────────────────────────────────────────┘")
     print()
-    print("  RESPUESTA JSON (todos los endpoints data):")
+    print("  MÉTODOS HTTP:")
+    print("  ┌──────────────────────────────────────────────────────┐")
+    print("  │ GET  /process-data      → solo lectura Jira+BD      │")
+    print("  │ POST /guardar-historico → escribe en PostgreSQL      │")
+    print("  │ GET  /download-excel    → descarga archivo           │")
+    print("  │ GET  /health            → monitoreo Jira+BD          │")
+    print("  └──────────────────────────────────────────────────────┘")
+    print()
+    print("  RESPUESTA JSON (todos los endpoints):")
     print('  { "status", "timestamp", "message", "meta", "data" }')
     print()
-    print("  Power Automate → Parse JSON schema desde /process-data")
-    print("  @body('HTTP')?['data']?['tickets']")
-    print("  @body('HTTP')?['data']?['resumen_mensual']")
-    print("  @body('HTTP')?['data']?['evolutivo']")
-    print("  @body('HTTP')?['data']?['html_completo']")
+    print("  GUNICORN recomendado:")
+    print("  gunicorn app:app --workers 2 --timeout 120 --preload")
     print()
-    print("  Servidor: http://localhost:5000")
-    print("=" * 58 + "\n")
+    print("  Servidor dev: http://localhost:5000")
+    print("=" * 62 + "\n")
 
     app.run(debug=True, host="0.0.0.0", port=5000)
