@@ -615,14 +615,18 @@ def construir_dataframe(issues: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows)
 
     if not df.empty:
-        # FIX 13: df.copy() explícito antes de asignaciones para evitar
-        # FutureWarning de pandas sobre chained assignment (romperá en pandas 3.0).
-        df = df.copy()
+        # FIX 13 (definitivo): Construir el DataFrame directamente con las columnas
+        # de fecha ya convertidas, en lugar de asignar sobre un DataFrame existente.
+        # Esto elimina completamente el FutureWarning de chained assignment de pandas
+        # porque nunca hay una asignación post-construcción sobre una vista.
+        # pd.to_datetime + dt.tz_localize opera sobre la Serie original (no una copia
+        # de una copia), así que pandas Copy-on-Write no detecta la cadena.
         for col in ("fecha_inicio", "fecha_fin", "fecha_comite"):
             # Jira está configurado en hora Lima: los timestamps ya son
             # hora local. Se parsean sin zona para no restar 5 horas.
-            df[col] = pd.to_datetime(df[col], errors="coerce").dt.tz_localize(None)
-        df["supervisor_final"] = df.apply(calcular_supervisor_final, axis=1)
+            parsed = pd.to_datetime(df[col], errors="coerce").dt.tz_localize(None)
+            df = df.assign(**{col: parsed})
+        df = df.assign(supervisor_final=df.apply(calcular_supervisor_final, axis=1))
 
     return df
 
@@ -631,10 +635,9 @@ def generar_mensual(df: pd.DataFrame) -> pd.DataFrame:
     """Agrupación mensual por supervisor, registrado_por y estado."""
     if df.empty:
         return pd.DataFrame()
-    # FIX 13: df.copy() ya garantiza que la asignación de "mes" no
-    # dispara FutureWarning de chained assignment.
-    df = df.copy()
-    df["mes"] = df["fecha_fin"].dt.strftime("%Y-%m")
+    # FIX 13 (definitivo): df.assign() crea una copia interna sin
+    # disparar FutureWarning — nunca modifica el DataFrame original.
+    df = df.assign(mes=df["fecha_fin"].dt.strftime("%Y-%m"))
     return (
         df.groupby(["supervisor_final", "registrado_por", "mes", "estado"])
         .size()
@@ -1213,7 +1216,7 @@ def process_data():
 
     # ── Validación explícita de tipos ─────────────────────────────
     fecha_inicio = _parse_date(
-        params.get("inicio", "2025-12-01"), "inicio"
+        params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
         params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
@@ -1322,7 +1325,7 @@ def guardar_historico_endpoint():
     params = _get_params()
 
     fecha_inicio = _parse_date(
-        params.get("inicio", "2026-01-01"), "inicio"
+        params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
         params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
@@ -1382,7 +1385,7 @@ def download_excel():
     params = _get_params()
 
     fecha_inicio = _parse_date(
-        params.get("inicio", "2025-12-01"), "inicio"
+        params.get("inicio", "2025-11-01"), "inicio"
     )
     fecha_fin = _parse_date(
         params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
