@@ -1213,7 +1213,7 @@ def process_data():
 
     # ── Validación explícita de tipos ─────────────────────────────
     fecha_inicio = _parse_date(
-        params.get("inicio", "2025-11-01"), "inicio"
+        params.get("inicio", "2025-12-01"), "inicio"
     )
     fecha_fin = _parse_date(
         params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
@@ -1322,7 +1322,7 @@ def guardar_historico_endpoint():
     params = _get_params()
 
     fecha_inicio = _parse_date(
-        params.get("inicio", "2025-12-01"), "inicio"
+        params.get("inicio", "2026-01-01"), "inicio"
     )
     fecha_fin = _parse_date(
         params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
@@ -1382,7 +1382,7 @@ def download_excel():
     params = _get_params()
 
     fecha_inicio = _parse_date(
-        params.get("inicio", "2025-11-01"), "inicio"
+        params.get("inicio", "2025-12-01"), "inicio"
     )
     fecha_fin = _parse_date(
         params.get("fin", _ayer_lima_str()), "fin"   # Por defecto: ayer en hora Lima
