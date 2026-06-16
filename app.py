@@ -290,8 +290,8 @@ def _get_engine():
             max_overflow=5,
             pool_recycle=1800,    # recicla conexiones inactivas cada 30 min
             connect_args={
-                'connect_timeout': 10,   # FIX 20: falla rápido si la BD está dormida (cold start Render)
-                'options': '-c statement_timeout=20000',  # FIX 20: timeout de 20s para queries SQL
+                'connect_timeout': 30,   # FIX 20: falla rápido si la BD está dormida (cold start Render)
+                'options': '-c statement_timeout=40000',  # FIX 20: timeout de 20s para queries SQL
             },
         )
         print(f"[{datetime.now():%H:%M:%S}] DB engine creado (lazy init)")
@@ -1370,7 +1370,22 @@ def guardar_historico_endpoint():
         )
 
     df           = construir_dataframe(issues)
-    resultado_bd = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
+    try:
+        resultado_bd = guardar_historico_evolutivo(df, fecha_inicio, fecha_fin)
+    except Exception as exc:
+        exc_str = str(exc).lower()
+        if "timeout" in exc_str or "connection refused" in exc_str or "operationalerror" in exc_str:
+            return _err(
+                "Error de conexión con la base de datos",
+                errors=[
+                    f"No se pudo establecer conexión con el servidor PostgreSQL en {PG_CONFIG['host']}:{PG_CONFIG['port']}.",
+                    "Causa probable: El firewall de tu base de datos externa está bloqueando las peticiones de Render.",
+                    "Solución: Copia las 'Outbound IP ranges' (IPs de salida) del Dashboard de Render (sección Connect -> Outbound) y agrégalas al allowlist de tu base de datos.",
+                    f"Detalle del error: {exc}"
+                ],
+                status=503,
+            )
+        raise
 
     return _ok(
         data=resultado_bd,
