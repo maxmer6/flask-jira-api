@@ -8,7 +8,7 @@ services:
     plan: free
     pythonVersion: "3.11.0"
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --worker-tmp-dir /dev/shm
 
     envVars:
       # Jira
@@ -46,6 +46,8 @@ services:
         value: proof
       - key: FLASK_ENV
         value: production
+      - key: PYTHONUNBUFFERED
+        value: "1"
 
   # ════════════════════════════════════════════════════════════
   # BASE DE DATOS PostgreSQL

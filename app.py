@@ -289,6 +289,10 @@ def _get_engine():
             pool_size=3,
             max_overflow=5,
             pool_recycle=1800,    # recicla conexiones inactivas cada 30 min
+            connect_args={
+                'connect_timeout': 10,   # FIX 20: falla rápido si la BD está dormida (cold start Render)
+                'options': '-c statement_timeout=20000',  # FIX 20: timeout de 20s para queries SQL
+            },
         )
         print(f"[{datetime.now():%H:%M:%S}] DB engine creado (lazy init)")
     return _DB_ENGINE
@@ -1584,11 +1588,25 @@ def health():
     """
     deep = _parse_bool(request.args.get("deep"), default=False)
 
+    # FIX 20: Siempre intentar calentar la conexión a BD (best-effort, no bloqueante).
+    # Power Automate llama /health ANTES de /process-data. Si la BD de Render
+    # está dormida (cold start free tier), este intento inicia el despertar.
+    # Aunque falle por timeout (connect_timeout=10s), la BD ya estará
+    # despertando para cuando /process-data la necesite segundos después.
+    db_warm = "skipped"
+    try:
+        with _get_engine().connect() as conn:
+            conn.execute(text("SELECT 1"))
+        db_warm = "ok"
+        print(f"[{datetime.now():%H:%M:%S}] /health — BD caliente ✅")
+    except Exception as exc:
+        db_warm = "warming_up"
+        print(f"[{datetime.now():%H:%M:%S}] /health — BD despertando (cold start): {exc}")
+
     if not deep:
-        # Modo rápido — responde de inmediato, sin red ni BD.
         return _ok(
-            data={"api": "ok", "jira": "skipped", "db": "skipped"},
-            message="API operativa (modo rápido — usa ?deep=true para verificar Jira/BD)",
+            data={"api": "ok", "jira": "skipped", "db": db_warm},
+            message="API operativa" if db_warm == "ok" else "API operativa (BD despertando)",
             meta={"version": "3.0"},
         )
 
