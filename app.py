@@ -1540,34 +1540,96 @@ def download_excel():
 # ║           instancias dormidas (Render free tier, etc.).      ║
 # ╚═══════════════════════════════════════════════════════════════╝
 # ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# ╔═══════════════════════════════════════════════════════════════╗
+# ║  GET /health                                                 ║
+# ╠═══════════════════════════════════════════════════════════════╣
+# ║  Método: GET ✅  Endpoint de monitoreo                       ║
+# ║  Razón  : Monitoreo/warm-up. Siempre idempotente.            ║
+# ║                                                                ║
+# ║  FIX BAD GATEWAY: La versión anterior hacía dos llamadas      ║
+# ║  bloqueantes EN SECUENCIA (Jira timeout=10s + primera         ║
+# ║  conexión real a Postgres). En Render free tier, la BD puede ║
+# ║  tardar >20s en despertar de un cold-start, y sumado al       ║
+# ║  timeout de Jira fácilmente supera los 30s de Gunicorn →     ║
+# ║  WORKER TIMEOUT → SIGKILL → 502 Bad Gateway en Power Automate.║
+# ║                                                                ║
+# ║  SOLUCIÓN:                                                    ║
+# ║  1) Por defecto, /health NO toca Jira ni Postgres — responde ║
+# ║     en milisegundos. Sirve como "ping" de despertar la        ║
+# ║     instancia sin arriesgar timeout.                          ║
+# ║  2) Con ?deep=true, se ejecutan ambas verificaciones EN       ║
+# ║     PARALELO (no secuencial) con timeouts cortos (5s c/u),    ║
+# ║     usando ThreadPoolExecutor con timeout total máximo de 8s. ║
+# ║     Nunca puede acercarse al límite de 30s de Gunicorn.       ║
+# ╚═══════════════════════════════════════════════════════════════╝
+# ─────────────────────────────────────────────────────────────────
 @app.route("/health", methods=["GET"])
 def health():
     """
-    Verifica disponibilidad de la API y conectividad con Jira y BD.
+    Verifica disponibilidad de la API.
+
+    Modo rápido (default): solo confirma que la app responde. No toca
+    Jira ni la BD — ideal para "despertar" la instancia desde Power
+    Automate sin riesgo de timeout.
+
+    Modo profundo (?deep=true): además verifica Jira y Postgres EN
+    PARALELO con timeout corto. Usar con moderación (agrega latencia
+    real de red), no como ping de cada minuto.
 
     Power Automate:
-        @body('HTTP')?['data']?['jira']  → "ok" | "error"
         @body('HTTP')?['data']?['api']   → "ok"
-        @body('HTTP')?['data']?['db']    → "ok" | "error"
+        @body('HTTP')?['data']?['jira']  → "ok" | "error" | "skipped"
+        @body('HTTP')?['data']?['db']    → "ok" | "error" | "skipped"
     """
+    deep = _parse_bool(request.args.get("deep"), default=False)
+
+    if not deep:
+        # Modo rápido — responde de inmediato, sin red ni BD.
+        return _ok(
+            data={"api": "ok", "jira": "skipped", "db": "skipped"},
+            message="API operativa (modo rápido — usa ?deep=true para verificar Jira/BD)",
+            meta={"version": "3.0"},
+        )
+
+    # ── Modo profundo: ejecutar ambas verificaciones EN PARALELO ──
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+    def _check_jira() -> bool:
+        try:
+            r = requests.get(
+                f"{JIRA_URL}/rest/api/3/myself",
+                auth=AUTH, headers=REQ_HEADERS, timeout=5,
+            )
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def _check_db() -> bool:
+        try:
+            with _get_engine().connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return True
+        except Exception:
+            return False
+
     jira_ok = False
     db_ok   = False
 
-    try:
-        r = requests.get(
-            f"{JIRA_URL}/rest/api/3/myself",
-            auth=AUTH, headers=REQ_HEADERS, timeout=10,
-        )
-        jira_ok = (r.status_code == 200)
-    except Exception:
-        pass
-
-    try:
-        with _get_engine().connect() as conn:
-            conn.execute(text("SELECT 1"))
-        db_ok = True
-    except Exception:
-        pass
+    # Timeout total de 8s para AMBOS checks juntos, muy por debajo de los
+    # 30s de Gunicorn. Si no terminan a tiempo, se reportan como error
+    # en lugar de bloquear el worker indefinidamente.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_jira = pool.submit(_check_jira)
+        future_db   = pool.submit(_check_db)
+        try:
+            jira_ok = future_jira.result(timeout=8)
+        except FutureTimeoutError:
+            jira_ok = False
+        try:
+            db_ok = future_db.result(timeout=8)
+        except FutureTimeoutError:
+            db_ok = False
 
     todo_ok     = jira_ok and db_ok
     status_code = 200 if todo_ok else 503
@@ -1578,7 +1640,7 @@ def health():
             "db":   "ok" if db_ok   else "error",
         },
         message="API operativa" if todo_ok else "Uno o más servicios no disponibles",
-        meta={"version": "3.0"},
+        meta={"version": "3.0", "modo": "deep"},
         status=status_code,
     )
 
